@@ -34,8 +34,29 @@ Transform vague requests into verifiable goals before starting — e.g. "fix the
 ### File enumeration
 
 Use `git ls-files --cached --others --exclude-standard` to enumerate source files.
+To verify a specific path: `git check-ignore -v <path>`
 
-Skip any path containing `/build/`, `/.gradle/`, `/.idea/`, `/.cxx/`, `/.externalNativeBuild/`, `/captures/`, and skip extensions `.apk .aab .aar .class .dex .hprof .jks .keystore` and files matching `local.properties`, `lint-results*`.
+**Skip directories** (any path segment matching these):
+
+| Ecosystem | Skip directories |
+|---|---|
+| All | `.git/` `.github/` (actions are readable; secrets are not) |
+| Java / Android | `build/` `.gradle/` `.cxx/` `.externalNativeBuild/` `captures/` |
+| C# / .NET | `bin/` `obj/` `.vs/` `packages/` `.nuget/` |
+| Node.js | `node_modules/` `dist/` `.next/` `.nuxt/` `.cache/` `coverage/` `.turbo/` |
+
+**Skip file extensions** (compiled output, binaries, secrets):
+
+| Ecosystem | Skip extensions |
+|---|---|
+| Java / Android | `.class` `.dex` `.apk` `.aab` `.aar` `.hprof` `.jks` `.keystore` |
+| C# / .NET | `.dll` `.exe` `.pdb` `.nupkg` `.snupkg` |
+| Node.js | `.map` (source maps) |
+| All | `.log` `.lock` (e.g. `package-lock.json`, `yarn.lock`, `packages.lock.json`) |
+
+**Skip specific filenames:**
+
+`local.properties`, `lint-results*`, `*.user`, `*.suo`, `*.DS_Store`
 
 On a blocked path: state the path, ask for the source file instead.
 
