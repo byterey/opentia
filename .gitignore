@@ -1,0 +1,17 @@
+# Claude Code local settings
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# .NET build output
+sample-app/**/bin/
+sample-app/**/obj/
+sample-app/**/.vs/
+sample-app/**/*.user
+sample-app/**/*.suo
