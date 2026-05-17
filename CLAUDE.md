@@ -2,6 +2,65 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working style
+
+### Before any code change
+
+State assumptions explicitly. If multiple interpretations exist, name them and confirm before picking one. If a simpler approach exists, say so.
+
+For multi-step tasks, state a brief plan first:
+
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+```
+
+Transform vague requests into verifiable goals before starting — e.g. "fix the bug" → "reproduce it in a test, then make the test pass".
+
+### Code changes
+
+- Touch only what the request requires. Do not improve adjacent code.
+- Match existing style. No abstractions or configurability beyond what was asked.
+- Every changed line must trace directly to the request.
+- If unrelated dead code is noticed, mention it — don't delete it.
+- Remove only imports/variables/functions that **your** changes made unused.
+
+### Response style
+
+- No preamble, affirmations, or filler. Answer directly; lead with code when code is the answer.
+- Omit explanation unless asked. If asked, max 3 sentences.
+- Error responses: state what failed + fix only.
+
+### File enumeration
+
+Use `git ls-files --cached --others --exclude-standard` to enumerate source files.
+
+Skip any path containing `/build/`, `/.gradle/`, `/.idea/`, `/.cxx/`, `/.externalNativeBuild/`, `/captures/`, and skip extensions `.apk .aab .aar .class .dex .hprof .jks .keystore` and files matching `local.properties`, `lint-results*`.
+
+On a blocked path: state the path, ask for the source file instead.
+
+### Tool permission labels
+
+Prefix every permission prompt with one of:
+
+- `[READ-ONLY]` — reads only, no state change
+- `[MUTATION]` — modifies files/state, recoverable via git
+- `[DESTRUCTIVE]` — irreversible (delete, force-push, drop table)
+- `[SYSTEM]` — touches packages, permissions, OS-level config
+
+### Test failure triage
+
+Default assumption: **the application is wrong, not the test.** The test is a specification of correct behaviour.
+
+Decision tree — follow in order, stop at first match:
+
+1. Test asserts something the app genuinely should do → fix the application, do not touch the test.
+2. A recent change intentionally altered the behaviour the test was specifying → update the test, document why in a comment.
+3. Test asserts the wrong thing (wrong expected value, tests internal implementation, assumption never true) → fix the test; state _"this test was wrong because …"_ before changing it.
+4. Test environment is the problem (flaky clock, shared state, missing double, OS-specific path) → fix the infrastructure; do not weaken the assertion.
+
+Never: delete a failing test, change an assertion to match broken output, mark a test ignored without a filed issue + expiry condition, or weaken an assertion to paper over a regression.
+
 ## What this repo is
 
 A **Test Impact Analysis (TIA)** tool for C# / .NET projects. Given a git diff, `assess_impact.py` selects only the tests whose execution path could have been affected by the change — avoiding a full suite run on every push.
