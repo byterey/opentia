@@ -436,6 +436,12 @@ _DOTNET_METHOD_RE = re.compile(
 
 _HUNK_HEADER_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@', re.MULTILINE)
 
+_CLASS_DECL_RE = re.compile(
+    r'^\s*(?:(?:public|protected|private|internal|static|abstract|sealed|'
+    r'final|partial|new)\s+)*'
+    r'(?:class|struct|record)\s+(\w+)'
+)
+
 
 class DotNetAdapter(LanguageAdapter):
     language = "dotnet"
@@ -1409,6 +1415,91 @@ def _extract_changed_methods(
     return sorted(found)
 
 
+def _find_method_owners(
+    lines: List[str],
+    method_re: re.Pattern,
+) -> Dict[int, Tuple[str, str]]:
+    """Map each method's 1-based line number to its (class_name, method_name).
+
+    Uses brace-depth tracking to determine the enclosing class even in files
+    with multiple classes (nested or sequential).
+    """
+    class_stack: List[Tuple[str, int]] = []  # (class_name, depth_at_open_brace)
+    depth = 0
+    result: Dict[int, Tuple[str, str]] = {}
+    for lineno, line in enumerate(lines, 1):
+        opens = line.count("{")
+        closes = line.count("}")
+        # Pop classes whose scope has ended
+        depth += opens - closes
+        while class_stack and depth <= class_stack[-1][1]:
+            class_stack.pop()
+        cls_m = _CLASS_DECL_RE.match(line)
+        if cls_m:
+            # Record depth before opens on this line as the class's outer depth
+            class_stack.append((cls_m.group(1), depth - opens))
+        meth_m = method_re.match(line)
+        if meth_m and class_stack:
+            result[lineno] = (class_stack[-1][0], meth_m.group(1))
+    return result
+
+
+def _extract_changed_method_owners(
+    file_abs: Path,
+    base_ref: Optional[str],
+    use_working_tree: bool,
+    git_root: Path,
+    method_re: re.Pattern,
+) -> List[Tuple[str, str]]:
+    """Return (class_name, method_name) pairs for methods with at least one changed line."""
+    try:
+        rel = str(file_abs.relative_to(git_root))
+    except ValueError:
+        return []
+    effective_base = base_ref if base_ref else "HEAD~1"
+    cmd = (
+        ["git", "diff", "--unified=0", "--", rel]
+        if use_working_tree
+        else ["git", "diff", "--unified=0", effective_base, "--", rel]
+    )
+    try:
+        diff_out = subprocess.check_output(
+            cmd, cwd=str(git_root), stderr=subprocess.DEVNULL, text=True
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return []
+
+    changed_ranges: List[Tuple[int, int]] = []
+    for m in _HUNK_HEADER_RE.finditer(diff_out):
+        start = int(m.group(1))
+        count = int(m.group(2)) if m.group(2) is not None else 1
+        if count > 0:
+            changed_ranges.append((start, start + count - 1))
+    if not changed_ranges:
+        return []
+
+    try:
+        lines = file_abs.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+    owners = _find_method_owners(lines, method_re)
+    if not owners:
+        return []
+
+    line_nos = sorted(owners)
+    found: Set[Tuple[str, str]] = set()
+    for rng_start, rng_end in changed_ranges:
+        idx = bisect.bisect_right(line_nos, rng_start) - 1
+        if idx >= 0:
+            found.add(owners[line_nos[idx]])
+        lo = bisect.bisect_left(line_nos, rng_start)
+        hi = bisect.bisect_right(line_nos, rng_end)
+        for i in range(lo, hi):
+            found.add(owners[line_nos[i]])
+    return sorted(found)
+
+
 def _find_test_methods_in_cache(
     source_methods: List[str],
     test_class: str,
@@ -1561,13 +1652,19 @@ def assess(
                             content = fp.read_text(encoding="utf-8", errors="replace")
                             test_classes = adapter.extract_test_identifiers(fp, content)
                             m_re = adapter.method_decl_re
-                            if m_re and len(test_classes) == 1:
-                                changed_methods = _extract_changed_methods(
+                            if m_re:
+                                owners = _extract_changed_method_owners(
                                     fp, base_ref, use_working_tree, git_root, m_re
                                 )
-                                if changed_methods:
-                                    cls = test_classes[0]
-                                    for mth in changed_methods:
+                                # Keep only owners whose class is a known test class
+                                test_class_set = set(test_classes)
+                                matched = [
+                                    (cls, mth)
+                                    for cls, mth in owners
+                                    if cls in test_class_set
+                                ]
+                                if matched:
+                                    for cls, mth in matched:
                                         local_classes.add(f"{cls}.{mth}")
                                 else:
                                     local_classes.update(test_classes)
