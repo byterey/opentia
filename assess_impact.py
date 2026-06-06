@@ -24,6 +24,7 @@ from __future__ import annotations
 import abc
 import argparse
 import bisect
+import collections
 import json
 import os
 import re
@@ -201,10 +202,13 @@ def get_changed_files(
         return []
 
 
-def get_changed_files_working_tree(git_root: Optional[Path] = None) -> List[FileChange]:
+def get_changed_files_working_tree(
+    git_root: Optional[Path] = None, staged_only: bool = False,
+) -> List[FileChange]:
     seen: Set[str] = set()
     all_changes: List[FileChange] = []
-    for extra in (["--cached"], []):
+    extras = [["--cached"]] if staged_only else [["--cached"], []]
+    for extra in extras:
         try:
             out = _run_git(
                 "diff", "--name-status", "--diff-filter=DACMRT", *extra, cwd=git_root,
@@ -283,9 +287,9 @@ def build_reverse_deps(projects: List[Project]) -> Dict[Path, Set[Path]]:
     result: Dict[Path, Set[Path]] = {path: set(testers) for path, testers in direct.items()}
     for source_path in [p.path for p in projects]:
         visited: Set[Path] = {source_path}
-        queue: List[Path] = list(dependents.get(source_path, set()))
+        queue: collections.deque = collections.deque(dependents.get(source_path, set()))
         while queue:
-            dep_path = queue.pop(0)
+            dep_path = queue.popleft()
             if dep_path in visited:
                 continue
             visited.add(dep_path)
@@ -766,13 +770,16 @@ class JavaAdapter(LanguageAdapter):
 
         try:
             content = gradle_path.read_text(encoding="utf-8", errors="replace")
-            test_kws = ["testImplementation", "testCompileOnly", "testRuntimeOnly", "testApi"]
-            for kw in test_kws:
-                if kw in content:
-                    for pkg in _JAVA_TEST_PACKAGES:
-                        if pkg in content:
-                            is_test = True
-                            break
+            # Match individual dependency lines: testImplementation 'junit:junit:4.13'
+            _dep_re = re.compile(
+                r'\b(testImplementation|testCompileOnly|testRuntimeOnly|testApi)\b'
+                r'[^\n]*?(["\'])([^"\']+)\2'
+            )
+            for dep_m in _dep_re.finditer(content):
+                coord = dep_m.group(3).lower()
+                if any(pkg in coord for pkg in _JAVA_TEST_PACKAGES):
+                    is_test = True
+                    break
             for m in re.finditer(r"project\s*\(\s*['\"]?:?([\w\-/.]+)['\"]?\s*\)", content):
                 dep = m.group(1).lstrip(":").replace(":", "/")
                 if dep not in refs:
@@ -1422,6 +1429,7 @@ def assess(
     head_ref: str = "HEAD",
     strategy: str = "hybrid",
     use_working_tree: bool = False,
+    staged_only: bool = False,
     adapter: Optional[LanguageAdapter] = None,
 ) -> ImpactResult:
     """Run the full test impact assessment."""
@@ -1431,7 +1439,10 @@ def assess(
     notes: List[str] = [f"Language adapter: {adapter.language}"]
 
     # ── 1. Collect changes ────────────────────────────────────────────────
-    if use_working_tree:
+    if staged_only:
+        changes = get_changed_files_working_tree(git_root, staged_only=True)
+        notes.append("Comparing staged changes only")
+    elif use_working_tree:
         changes = get_changed_files_working_tree(git_root)
         notes.append("Comparing against working tree (staged + unstaged)")
     elif base_ref:
@@ -1555,17 +1566,18 @@ def assess(
                     affected_source_names.add(owner.name)
                     found_tests.update(test_paths)
 
-        if strategy in ("convention", "hybrid"):
-            for proj_path, cls in adapter.strategy_convention(change, tp):
-                found_tests.add(proj_path)
-                local_classes.add(cls)
+        if not is_test_file_change:
+            if strategy in ("convention", "hybrid"):
+                for proj_path, cls in adapter.strategy_convention(change, tp):
+                    found_tests.add(proj_path)
+                    local_classes.add(cls)
 
-        if strategy in ("symbol", "hybrid"):
-            for proj_path, cls in adapter.strategy_symbol_search(
-                change, tp, git_root, test_file_cache
-            ):
-                found_tests.add(proj_path)
-                local_classes.add(cls)
+            if strategy in ("symbol", "hybrid"):
+                for proj_path, cls in adapter.strategy_symbol_search(
+                    change, tp, git_root, test_file_cache
+                ):
+                    found_tests.add(proj_path)
+                    local_classes.add(cls)
 
         # Source method → test method convention: when a source method changes,
         # try to narrow class-level entries to specific test methods by name.
@@ -1700,7 +1712,7 @@ def fmt_human(result: ImpactResult) -> str:
         "  TEST IMPACT ANALYSIS",
         sep,
         f"  Language: {result.language}",
-        f"  Status  : {'RUN ALL TESTS' if result.run_all else 'Targeted run'}",
+        f"  Status  : {'RUN ALL TESTS' if result.run_all and not result.test_filter else 'Targeted run'}",
         f"  Reason  : {result.reason}",
         sep,
     ]
@@ -1873,6 +1885,10 @@ examples:
         help="Analyse working-tree changes (staged + unstaged) instead of a git diff",
     )
     parser.add_argument(
+        "--staged", action="store_true",
+        help="Analyse only staged (indexed) changes — useful before committing",
+    )
+    parser.add_argument(
         "extra_args", nargs=argparse.REMAINDER,
         help="Arguments forwarded to the test runner (after --) when --run is used",
     )
@@ -1898,6 +1914,7 @@ def main() -> None:
         head_ref=args.head,
         strategy=args.strategy,
         use_working_tree=args.unstaged,
+        staged_only=args.staged,
         adapter=adapter,
     )
 
