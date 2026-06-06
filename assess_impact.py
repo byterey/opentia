@@ -1580,7 +1580,12 @@ def assess(
         )
         affected_test_paths = {p.path for p in tp}
 
-    # ── 11. Build filter ──────────────────────────────────────────────────
+    # ── 11. Prefer method-level over class-level when both exist ─────────
+    if any("." in c for c in affected_classes):
+        covered = {c.rsplit(".", 1)[0] for c in affected_classes if "." in c}
+        affected_classes = {c for c in affected_classes if "." in c or c not in covered}
+
+    # ── 12. Build filter ──────────────────────────────────────────────────
     run_all_triggered = (
         bool(tp)
         and adapter.prefer_run_all_when_all_affected()
