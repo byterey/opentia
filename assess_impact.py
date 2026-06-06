@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import abc
 import argparse
+import bisect
 import json
 import os
 import re
@@ -380,6 +381,10 @@ class LanguageAdapter(abc.ABC):
         """
         return True
 
+    # Set to a compiled regex in subclasses to enable method-level precision.
+    # Must capture the method name in group 1.
+    method_decl_re: Optional[re.Pattern] = None
+
 
 # ---------------------------------------------------------------------------
 # .NET adapter
@@ -414,9 +419,22 @@ _DOTNET_TYPE_DECL_RE = re.compile(
 
 _DOTNET_TEST_CLASS_RE = re.compile(r'\bclass\s+(\w+)')
 
+# Matches C# method/constructor declarations that start with at least one access modifier.
+# Captures the method name (last identifier before the opening parenthesis).
+_DOTNET_METHOD_RE = re.compile(
+    r'^\s*'
+    r'(?:(?:public|protected|internal|private|static|virtual|override|'
+    r'abstract|async|new|sealed|partial)\s+)+'
+    r'(?:[\w<>\[\]?,\.]+\s+)*'
+    r'(\w+)\s*(?:<[^>]*>)?\s*\('
+)
+
+_HUNK_HEADER_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@', re.MULTILINE)
+
 
 class DotNetAdapter(LanguageAdapter):
     language = "dotnet"
+    method_decl_re = _DOTNET_METHOD_RE
 
     _INFRA_EXTS: Tuple[str, ...] = (".sln", ".csproj")
     _INFRA_NAMES: Tuple[str, ...] = (
@@ -589,7 +607,7 @@ class DotNetAdapter(LanguageAdapter):
         self, result: ImpactResult, extra_args: List[str], cwd: Optional[Path],
     ) -> int:
         filter_args = ["--filter", result.test_filter] if result.test_filter else []
-        if result.run_all:
+        if result.run_all and not result.test_filter:
             if result.workspace_files:
                 code = 0
                 for sln in result.workspace_files:
@@ -618,7 +636,7 @@ class DotNetAdapter(LanguageAdapter):
 
     def fmt_command(self, result: ImpactResult) -> str:
         filter_part = f' --filter "{result.test_filter}"' if result.test_filter else ""
-        if result.run_all:
+        if result.run_all and not result.test_filter:
             if result.workspace_files:
                 return " && ".join(f'dotnet test "{s}"' for s in result.workspace_files)
             return "dotnet test"
@@ -650,9 +668,21 @@ _JAVA_TYPE_DECL_RE = re.compile(
 
 _JAVA_TEST_CLASS_RE = re.compile(r'\bclass\s+(\w+)')
 
+# Matches Java/Kotlin method declarations with at least one access modifier.
+_JAVA_METHOD_RE = re.compile(
+    r'^\s*'
+    r'(?:@\w+(?:\([^)]*\))?\s+)*'
+    r'(?:(?:public|protected|private|static|final|abstract|synchronized|'
+    r'native|default|strictfp)\s+)+'
+    r'(?:<[^>]*>\s+)?'
+    r'(?:[\w<>\[\]?,\.]+\s+)*'
+    r'(\w+)\s*\('
+)
+
 
 class JavaAdapter(LanguageAdapter):
     language = "java"
+    method_decl_re = _JAVA_METHOD_RE
 
     _SOURCE_EXTS: Tuple[str, ...] = (".java", ".kt", ".groovy", ".scala")
     _INFRA_NAMES: Tuple[str, ...] = (
@@ -874,7 +904,13 @@ class JavaAdapter(LanguageAdapter):
             return "", False
         if len(test_ids) > FILTER_CLASS_LIMIT:
             return "", True
-        return ",".join(sorted(test_ids)), False  # Maven Surefire -Dtest= format
+        # Maven Surefire uses # for method separator (Class#method), while the
+        # internal representation uses dot (Class.method) for Gradle compatibility.
+        surefire = [
+            tid.replace(".", "#", 1) if "." in tid else tid
+            for tid in sorted(test_ids)
+        ]
+        return ",".join(surefire), False
 
     def extract_test_identifiers(self, file_path: Path, content: str) -> List[str]:
         return _JAVA_TEST_CLASS_RE.findall(content)
@@ -890,7 +926,7 @@ class JavaAdapter(LanguageAdapter):
     def run_tests(
         self, result: ImpactResult, extra_args: List[str], cwd: Optional[Path],
     ) -> int:
-        if result.run_all:
+        if result.run_all and not result.test_filter:
             is_gradle = any("gradle" in Path(f).name.lower() for f in result.workspace_files)
             if is_gradle:
                 gradle = "./gradlew" if self._has_gradlew(cwd) else "gradle"
@@ -926,7 +962,7 @@ class JavaAdapter(LanguageAdapter):
 
     def fmt_command(self, result: ImpactResult) -> str:
         is_gradle = any("gradle" in Path(f).name.lower() for f in result.workspace_files)
-        if result.run_all:
+        if result.run_all and not result.test_filter:
             return "./gradlew test" if is_gradle else "mvn test"
         if not result.test_project_paths:
             return "(no tests to run)"
@@ -1290,6 +1326,69 @@ def _make_run_all(
     )
 
 
+def _extract_changed_methods(
+    file_abs: Path,
+    base_ref: Optional[str],
+    use_working_tree: bool,
+    git_root: Path,
+    method_re: re.Pattern,
+) -> List[str]:
+    """Return method names that have at least one changed line in file_abs."""
+    try:
+        rel = str(file_abs.relative_to(git_root))
+    except ValueError:
+        return []
+    effective_base = base_ref if base_ref else "HEAD~1"
+    cmd = (
+        ["git", "diff", "--unified=0", "--", rel]
+        if use_working_tree
+        else ["git", "diff", "--unified=0", effective_base, "--", rel]
+    )
+    try:
+        diff_out = subprocess.check_output(
+            cmd, cwd=str(git_root), stderr=subprocess.DEVNULL, text=True
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return []
+
+    changed_ranges: List[Tuple[int, int]] = []
+    for m in _HUNK_HEADER_RE.finditer(diff_out):
+        start = int(m.group(1))
+        count = int(m.group(2)) if m.group(2) is not None else 1
+        if count > 0:
+            changed_ranges.append((start, start + count - 1))
+    if not changed_ranges:
+        return []
+
+    try:
+        lines = file_abs.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+    method_starts: List[Tuple[int, str]] = []
+    for i, line in enumerate(lines, 1):
+        m = method_re.match(line)
+        if m:
+            method_starts.append((i, m.group(1)))
+    if not method_starts:
+        return []
+
+    line_nos = [ln for ln, _ in method_starts]
+    names = [nm for _, nm in method_starts]
+    found: Set[str] = set()
+    for rng_start, rng_end in changed_ranges:
+        # Method whose body contains rng_start
+        idx = bisect.bisect_right(line_nos, rng_start) - 1
+        if idx >= 0:
+            found.add(names[idx])
+        # Methods declared inside the changed range (new methods)
+        lo = bisect.bisect_left(line_nos, rng_start)
+        hi = bisect.bisect_right(line_nos, rng_end)
+        for i in range(lo, hi):
+            found.add(names[i])
+    return sorted(found)
+
+
 def assess(
     root: Path,
     git_root: Path,
@@ -1407,8 +1506,20 @@ def assess(
                     if fp.exists():
                         try:
                             content = fp.read_text(encoding="utf-8", errors="replace")
-                            for ident in adapter.extract_test_identifiers(fp, content):
-                                affected_classes.add(ident)
+                            test_classes = adapter.extract_test_identifiers(fp, content)
+                            m_re = adapter.method_decl_re
+                            if m_re and len(test_classes) == 1 and not change.is_deleted:
+                                changed_methods = _extract_changed_methods(
+                                    fp, base_ref, use_working_tree, git_root, m_re
+                                )
+                                if changed_methods:
+                                    cls = test_classes[0]
+                                    for mth in changed_methods:
+                                        affected_classes.add(f"{cls}.{mth}")
+                                else:
+                                    affected_classes.update(test_classes)
+                            else:
+                                affected_classes.update(test_classes)
                         except OSError:
                             pass
                 else:
