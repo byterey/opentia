@@ -1519,6 +1519,7 @@ def assess(
     def _handle_source(change: FileChange) -> None:
         found_tests: Set[Path] = set()
         local_classes: Set[str] = set()
+        is_test_file_change = False  # True when the changed file lives in a test project
 
         for analysis_path in change.analysis_paths():
             owner, test_paths = strategy_dependency_graph(
@@ -1528,6 +1529,7 @@ def assess(
                 # is_test_file(): .NET always True; Java uses "src/test/"; Node uses .test./.spec.
                 is_test = owner.is_test_project and adapter.is_test_file(analysis_path)
                 if is_test:
+                    is_test_file_change = True
                     found_tests.add(owner.path)
                     fp = (git_root / change.path).resolve()
                     if fp.exists() and not change.is_deleted:
@@ -1568,12 +1570,9 @@ def assess(
         # Source method → test method convention: when a source method changes,
         # try to narrow class-level entries to specific test methods by name.
         m_re = adapter.method_decl_re
-        if m_re and local_classes and not change.is_deleted:
+        if m_re and local_classes and not change.is_deleted and not is_test_file_change:
             fp = (git_root / change.path).resolve()
-            is_source_file = fp.exists() and any(
-                adapter.is_test_file(ap) for ap in change.analysis_paths()
-            ) is False
-            if is_source_file:
+            if fp.exists():
                 src_methods = _extract_changed_methods(
                     fp, base_ref, use_working_tree, git_root, m_re
                 )
