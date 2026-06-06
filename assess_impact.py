@@ -1389,6 +1389,32 @@ def _extract_changed_methods(
     return sorted(found)
 
 
+def _find_test_methods_in_cache(
+    source_methods: List[str],
+    test_class: str,
+    cache: Dict[Path, str],
+    method_re: re.Pattern,
+) -> List[str]:
+    """Return test method names whose names contain any source method name (case-insensitive)."""
+    needles = [m.lower() for m in source_methods]
+    class_pat = re.compile(r'\bclass\s+' + re.escape(test_class) + r'\b')
+    found: List[str] = []
+    seen: Set[str] = set()
+    for content in cache.values():
+        if not class_pat.search(content):
+            continue
+        for line in content.splitlines():
+            m = method_re.match(line)
+            if m:
+                name = m.group(1)
+                if name in seen:
+                    continue
+                if any(needle in name.lower() for needle in needles):
+                    found.append(name)
+                    seen.add(name)
+    return found
+
+
 def assess(
     root: Path,
     git_root: Path,
@@ -1492,6 +1518,7 @@ def assess(
 
     def _handle_source(change: FileChange) -> None:
         found_tests: Set[Path] = set()
+        local_classes: Set[str] = set()
 
         for analysis_path in change.analysis_paths():
             owner, test_paths = strategy_dependency_graph(
@@ -1503,23 +1530,23 @@ def assess(
                 if is_test:
                     found_tests.add(owner.path)
                     fp = (git_root / change.path).resolve()
-                    if fp.exists():
+                    if fp.exists() and not change.is_deleted:
                         try:
                             content = fp.read_text(encoding="utf-8", errors="replace")
                             test_classes = adapter.extract_test_identifiers(fp, content)
                             m_re = adapter.method_decl_re
-                            if m_re and len(test_classes) == 1 and not change.is_deleted:
+                            if m_re and len(test_classes) == 1:
                                 changed_methods = _extract_changed_methods(
                                     fp, base_ref, use_working_tree, git_root, m_re
                                 )
                                 if changed_methods:
                                     cls = test_classes[0]
                                     for mth in changed_methods:
-                                        affected_classes.add(f"{cls}.{mth}")
+                                        local_classes.add(f"{cls}.{mth}")
                                 else:
-                                    affected_classes.update(test_classes)
+                                    local_classes.update(test_classes)
                             else:
-                                affected_classes.update(test_classes)
+                                local_classes.update(test_classes)
                         except OSError:
                             pass
                 else:
@@ -1529,14 +1556,44 @@ def assess(
         if strategy in ("convention", "hybrid"):
             for proj_path, cls in adapter.strategy_convention(change, tp):
                 found_tests.add(proj_path)
-                affected_classes.add(cls)
+                local_classes.add(cls)
 
         if strategy in ("symbol", "hybrid"):
             for proj_path, cls in adapter.strategy_symbol_search(
                 change, tp, git_root, test_file_cache
             ):
                 found_tests.add(proj_path)
-                affected_classes.add(cls)
+                local_classes.add(cls)
+
+        # Source method → test method convention: when a source method changes,
+        # try to narrow class-level entries to specific test methods by name.
+        m_re = adapter.method_decl_re
+        if m_re and local_classes and not change.is_deleted:
+            fp = (git_root / change.path).resolve()
+            is_source_file = fp.exists() and any(
+                adapter.is_test_file(ap) for ap in change.analysis_paths()
+            ) is False
+            if is_source_file:
+                src_methods = _extract_changed_methods(
+                    fp, base_ref, use_working_tree, git_root, m_re
+                )
+                if src_methods:
+                    refined: Set[str] = set()
+                    for cls in local_classes:
+                        if "." in cls:
+                            refined.add(cls)
+                            continue
+                        test_meths = _find_test_methods_in_cache(
+                            src_methods, cls, test_file_cache, m_re
+                        )
+                        if test_meths:
+                            for mth in test_meths:
+                                refined.add(f"{cls}.{mth}")
+                        else:
+                            refined.add(cls)
+                    local_classes = refined
+
+        affected_classes.update(local_classes)
 
         if found_tests:
             affected_test_paths.update(found_tests)
