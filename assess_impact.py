@@ -373,6 +373,13 @@ class LanguageAdapter(abc.ABC):
         """Extract test class names (or file stems for Node) from a test file."""
         return []
 
+    def prefer_run_all_when_all_affected(self) -> bool:
+        """True → use workspace root file when all test projects are affected.
+        .NET uses .sln; Java uses mvn/gradlew root. Node prefers per-file
+        --testPathPattern filtering even when fully affected.
+        """
+        return True
+
 
 # ---------------------------------------------------------------------------
 # .NET adapter
@@ -1153,6 +1160,9 @@ class NodeAdapter(LanguageAdapter):
     def extract_test_identifiers(self, file_path: Path, content: str) -> List[str]:
         return [file_path.stem]
 
+    def prefer_run_all_when_all_affected(self) -> bool:
+        return False  # always use --testPathPattern; npx jest alone runs everything
+
     def _detect_runner(self, result: ImpactResult) -> str:
         for pkg_path in result.test_project_paths + result.workspace_files:
             try:
@@ -1460,7 +1470,11 @@ def assess(
         affected_test_paths = {p.path for p in tp}
 
     # ── 11. Build filter ──────────────────────────────────────────────────
-    run_all_triggered = bool(tp) and affected_test_paths == {p.path for p in tp}
+    run_all_triggered = (
+        bool(tp)
+        and adapter.prefer_run_all_when_all_affected()
+        and affected_test_paths == {p.path for p in tp}
+    )
     test_filter, capped = adapter.build_filter(affected_classes)
     if capped:
         notes.append(
