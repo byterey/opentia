@@ -33,123 +33,98 @@ python assess_impact.py --base HEAD~1 --root <path-to-your-solution> --run
 
 ---
 
-## Testing the script with sample-app
+## Validating the script with sample-app
 
-`sample-app/` is a self-contained C# solution with **152 unit tests** across two test projects, designed to exercise every code path in the script.
+`sample-app/` is a self-contained C# solution purpose-built to verify the script against realistic dependency scenarios.
+
+### Dependency graph
 
 ```
-SampleApp.Core       (no deps)            ← 92 tests in SampleApp.Core.Tests
-    ↑
-SampleApp.Services   (depends on Core)    ← 60 tests in SampleApp.Services.Tests
-    ↑
-SampleApp.Api        (depends on Services) [no test project]
+SampleApp.Core       (no deps)             ← 92 tests in SampleApp.Core.Tests
+        ↑
+SampleApp.Services   (depends on Core)     ← 60 tests in SampleApp.Services.Tests
+        ↑
+SampleApp.Api        (depends on Services)   [no test project]
 ```
 
-### Step 1 — Confirm tests pass clean
+**Key implication:** changing anything in `Core` triggers **both** test projects because `Services` depends on `Core` — the BFS propagates transitively.
+
+### Step 1 — Confirm baseline
 
 ```bash
 cd sample-app
 dotnet test SampleApp.sln
 # Expected: 152 passed, 0 failed
+cd ..
 ```
 
-### Step 2 — Run a scenario
+### Step 2 — Run validation scenarios
 
-Make a change, then run the script. Use either workflow:
+Each scenario tests a distinct behaviour. Use `--unstaged` to avoid committing:
 
-**A. Commit-based** (matches real CI behaviour):
-
-```bash
-# From the repo root
-echo "// change" >> sample-app/src/SampleApp.Core/Models/Product.cs
-git add .
-git commit -m "test: touch Product.cs"
-
-python assess_impact.py --base HEAD~1 --root sample-app
-```
-
-**B. Unstaged** (faster, no commit needed):
+**Scenario 1 — Ignored file → no tests selected**
 
 ```bash
-echo "// change" >> sample-app/src/SampleApp.Core/Models/Product.cs
-
+echo "# change" >> sample-app/.gitignore
 python assess_impact.py --unstaged --root sample-app
-
-# Undo
-git checkout sample-app/src/SampleApp.Core/Models/Product.cs
+# Expected: no tests to run (file type is ignored)
+git checkout sample-app/.gitignore
 ```
 
-### Step 3 — Verify the output
+**Scenario 2 — Services-only change → only `Services.Tests`**
+
+```bash
+echo "// change" >> sample-app/src/SampleApp.Services/PricingService.cs
+python assess_impact.py --unstaged --root sample-app
+# Expected: SampleApp.Services.Tests only, filtered to PricingServiceTests
+git checkout sample-app/src/SampleApp.Services/PricingService.cs
+```
+
+**Scenario 3 — Core change → both test projects (transitive)**
+
+```bash
+echo "// change" >> sample-app/src/SampleApp.Core/Utilities/MathHelper.cs
+python assess_impact.py --unstaged --root sample-app
+# Expected: SampleApp.Core.Tests AND SampleApp.Services.Tests
+# Services.Tests is included because Services depends on Core (BFS)
+git checkout sample-app/src/SampleApp.Core/Utilities/MathHelper.cs
+```
+
+**Scenario 4 — Infrastructure change → all tests forced**
+
+```bash
+echo " " >> sample-app/SampleApp.sln
+python assess_impact.py --unstaged --root sample-app
+# Expected: run_all = true, all test projects
+git checkout sample-app/SampleApp.sln
+```
+
+### Step 3 — Read the output
 
 ```
 ──────────────────────────────────────────────────────────────────
   TEST IMPACT ANALYSIS
 ──────────────────────────────────────────────────────────────────
-  Status  : RUN ALL TESTS          ← "Targeted run" = good; "RUN ALL" = fallback triggered
-  Affected test projects (2):
-    • SampleApp.Core.Tests
+  Status  : Targeted run            ← "RUN ALL TESTS" means a fallback was triggered
+  Affected test projects (1):
     • SampleApp.Services.Tests
-  Affected test classes (4):
-    • InventoryServiceTests
-    • OrderServiceTests
-    • ProductServiceTests
-    • ProductTests
+  Affected test classes (1):
+    • PricingServiceTests
   dotnet command:
-    dotnet test "...SampleApp.sln"
+    dotnet test "...SampleApp.Services.Tests.csproj" --filter "FullyQualifiedName~PricingServiceTests"
+──────────────────────────────────────────────────────────────────
 ```
 
-### Scenario reference
+`Status: Targeted run` means the script selected a subset. `Status: RUN ALL TESTS` means it fell back to running everything (expected for Scenario 4).
 
-Each scenario tests a distinct behaviour of the script:
+### Additional scenarios
 
-| Scenario | File to change | Expected result |
-|---|---|---|
-| **A** Core model | `sample-app/src/SampleApp.Core/Models/Product.cs` | Both test projects (transitive BFS) |
-| **B** Service only | `sample-app/src/SampleApp.Services/PricingService.cs` | `Services.Tests` + filter `PricingServiceTests` |
-| **C** Test file | `sample-app/tests/SampleApp.Core.Tests/Utilities/StringHelperTests.cs` | `Core.Tests` + filter `StringHelperTests` |
-| **D** Config file | `sample-app/src/SampleApp.Services/appsettings.json` | `Services.Tests`, no class filter |
-| **E** Infrastructure | `sample-app/src/SampleApp.Services/SampleApp.Services.csproj` | `run_all = true`, both projects |
-| **F** Ignored file | `sample-app/.gitignore` | No tests (skipped entirely) |
-
-Run a scenario:
-
-```bash
-# Scenario A — Core change triggers both test projects
-echo "// change" >> sample-app/src/SampleApp.Core/Models/Product.cs
-git add . && git commit -m "scenario A"
-python assess_impact.py --base HEAD~1 --root sample-app
-git revert HEAD --no-edit
-
-# Scenario B — Service change triggers only Services.Tests
-echo "// change" >> sample-app/src/SampleApp.Services/PricingService.cs
-git add . && git commit -m "scenario B"
-python assess_impact.py --base HEAD~1 --root sample-app
-git revert HEAD --no-edit
-
-# Scenario C — Editing a test file targets only that class
-echo "// change" >> sample-app/tests/SampleApp.Core.Tests/Utilities/StringHelperTests.cs
-git add . && git commit -m "scenario C"
-python assess_impact.py --base HEAD~1 --root sample-app
-git revert HEAD --no-edit
-
-# Scenario D — Config file runs project-level (no class filter)
-echo "{}" >> sample-app/src/SampleApp.Services/appsettings.json
-git add . && git commit -m "scenario D"
-python assess_impact.py --base HEAD~1 --root sample-app
-git revert HEAD --no-edit
-
-# Scenario E — Infrastructure file forces run-all
-echo "<!--change-->" >> sample-app/src/SampleApp.Services/SampleApp.Services.csproj
-git add . && git commit -m "scenario E"
-python assess_impact.py --base HEAD~1 --root sample-app
-git revert HEAD --no-edit
-
-# Scenario F — Ignored file skips tests entirely
-echo "# change" >> sample-app/.gitignore
-git add . && git commit -m "scenario F"
-python assess_impact.py --base HEAD~1 --root sample-app
-git revert HEAD --no-edit
-```
+| File to change | Expected result |
+|---|---|
+| `src/SampleApp.Core/Models/Product.cs` | Both test projects, filtered to `ProductTests` + dependent service tests |
+| `tests/SampleApp.Core.Tests/Utilities/StringHelperTests.cs` | `Core.Tests` only, filtered to `StringHelperTests` |
+| `src/SampleApp.Services/appsettings.json` | `Services.Tests`, no class filter (config file) |
+| `src/SampleApp.Services/SampleApp.Services.csproj` | All tests, `run_all = true` (infra file) |
 
 ---
 
