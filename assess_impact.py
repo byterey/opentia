@@ -28,6 +28,7 @@ import collections
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -565,6 +566,10 @@ class DotNetAdapter(LanguageAdapter):
         if change.is_deleted:
             return []
         file_abs = (git_root / change.path).resolve()
+        try:
+            file_abs.relative_to(git_root)
+        except ValueError:
+            return []
         if not file_abs.exists() or file_abs.suffix.lower() != ".cs":
             return []
         try:
@@ -874,6 +879,10 @@ class JavaAdapter(LanguageAdapter):
         if change.is_deleted:
             return []
         file_abs = (git_root / change.path).resolve()
+        try:
+            file_abs.relative_to(git_root)
+        except ValueError:
+            return []
         if not file_abs.exists() or file_abs.suffix.lower() not in self._SOURCE_EXTS:
             return []
         try:
@@ -1160,6 +1169,10 @@ class NodeAdapter(LanguageAdapter):
         if change.is_deleted:
             return []
         file_abs = (git_root / change.path).resolve()
+        try:
+            file_abs.relative_to(git_root)
+        except ValueError:
+            return []
         if not file_abs.exists() or file_abs.suffix.lower() not in self._SOURCE_EXTS:
             return []
         try:
@@ -1775,12 +1788,14 @@ def fmt_github_actions(result: ImpactResult) -> str:
         "has_tests": str(bool(result.test_project_paths or result.run_all)).lower(),
         "test_project_paths": ",".join(result.test_project_paths),
     }
-    lines = [f'echo "{k}={v}" >> $GITHUB_OUTPUT' for k, v in simple.items()]
+    # shlex.quote ensures values with spaces, quotes, or special chars are safe.
+    lines = [f"echo {shlex.quote(f'{k}={v}')} >> $GITHUB_OUTPUT" for k, v in simple.items()]
     cmd = result.test_command
+    # Heredoc syntax for multi-line / quote-containing test_command value.
     lines += [
-        'echo "test_command<<__GHA_EOF__" >> $GITHUB_OUTPUT',
-        f'echo "{cmd}" >> $GITHUB_OUTPUT',
-        'echo "__GHA_EOF__" >> $GITHUB_OUTPUT',
+        'printf "test_command<<__GHA_EOF__\\n" >> $GITHUB_OUTPUT',
+        f'printf "%s\\n" {shlex.quote(cmd)} >> $GITHUB_OUTPUT',
+        'printf "__GHA_EOF__\\n" >> $GITHUB_OUTPUT',
     ]
     return "\n".join(lines)
 
