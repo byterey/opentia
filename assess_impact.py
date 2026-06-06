@@ -24,9 +24,11 @@ from __future__ import annotations
 import abc
 import argparse
 import bisect
+import collections
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -201,10 +203,13 @@ def get_changed_files(
         return []
 
 
-def get_changed_files_working_tree(git_root: Optional[Path] = None) -> List[FileChange]:
+def get_changed_files_working_tree(
+    git_root: Optional[Path] = None, staged_only: bool = False,
+) -> List[FileChange]:
     seen: Set[str] = set()
     all_changes: List[FileChange] = []
-    for extra in (["--cached"], []):
+    extras = [["--cached"]] if staged_only else [["--cached"], []]
+    for extra in extras:
         try:
             out = _run_git(
                 "diff", "--name-status", "--diff-filter=DACMRT", *extra, cwd=git_root,
@@ -283,9 +288,9 @@ def build_reverse_deps(projects: List[Project]) -> Dict[Path, Set[Path]]:
     result: Dict[Path, Set[Path]] = {path: set(testers) for path, testers in direct.items()}
     for source_path in [p.path for p in projects]:
         visited: Set[Path] = {source_path}
-        queue: List[Path] = list(dependents.get(source_path, set()))
+        queue: collections.deque = collections.deque(dependents.get(source_path, set()))
         while queue:
-            dep_path = queue.pop(0)
+            dep_path = queue.popleft()
             if dep_path in visited:
                 continue
             visited.add(dep_path)
@@ -431,6 +436,12 @@ _DOTNET_METHOD_RE = re.compile(
 
 _HUNK_HEADER_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@', re.MULTILINE)
 
+_CLASS_DECL_RE = re.compile(
+    r'^\s*(?:(?:public|protected|private|internal|static|abstract|sealed|'
+    r'final|partial|new)\s+)*'
+    r'(?:class|struct|record)\s+(\w+)'
+)
+
 
 class DotNetAdapter(LanguageAdapter):
     language = "dotnet"
@@ -561,6 +572,10 @@ class DotNetAdapter(LanguageAdapter):
         if change.is_deleted:
             return []
         file_abs = (git_root / change.path).resolve()
+        try:
+            file_abs.relative_to(git_root)
+        except ValueError:
+            return []
         if not file_abs.exists() or file_abs.suffix.lower() != ".cs":
             return []
         try:
@@ -766,13 +781,16 @@ class JavaAdapter(LanguageAdapter):
 
         try:
             content = gradle_path.read_text(encoding="utf-8", errors="replace")
-            test_kws = ["testImplementation", "testCompileOnly", "testRuntimeOnly", "testApi"]
-            for kw in test_kws:
-                if kw in content:
-                    for pkg in _JAVA_TEST_PACKAGES:
-                        if pkg in content:
-                            is_test = True
-                            break
+            # Match individual dependency lines: testImplementation 'junit:junit:4.13'
+            _dep_re = re.compile(
+                r'\b(testImplementation|testCompileOnly|testRuntimeOnly|testApi)\b'
+                r'[^\n]*?(["\'])([^"\']+)\2'
+            )
+            for dep_m in _dep_re.finditer(content):
+                coord = dep_m.group(3).lower()
+                if any(pkg in coord for pkg in _JAVA_TEST_PACKAGES):
+                    is_test = True
+                    break
             for m in re.finditer(r"project\s*\(\s*['\"]?:?([\w\-/.]+)['\"]?\s*\)", content):
                 dep = m.group(1).lstrip(":").replace(":", "/")
                 if dep not in refs:
@@ -867,6 +885,10 @@ class JavaAdapter(LanguageAdapter):
         if change.is_deleted:
             return []
         file_abs = (git_root / change.path).resolve()
+        try:
+            file_abs.relative_to(git_root)
+        except ValueError:
+            return []
         if not file_abs.exists() or file_abs.suffix.lower() not in self._SOURCE_EXTS:
             return []
         try:
@@ -1153,6 +1175,10 @@ class NodeAdapter(LanguageAdapter):
         if change.is_deleted:
             return []
         file_abs = (git_root / change.path).resolve()
+        try:
+            file_abs.relative_to(git_root)
+        except ValueError:
+            return []
         if not file_abs.exists() or file_abs.suffix.lower() not in self._SOURCE_EXTS:
             return []
         try:
@@ -1389,6 +1415,117 @@ def _extract_changed_methods(
     return sorted(found)
 
 
+def _find_method_owners(
+    lines: List[str],
+    method_re: re.Pattern,
+) -> Dict[int, Tuple[str, str]]:
+    """Map each method's 1-based line number to its (class_name, method_name).
+
+    Uses brace-depth tracking to determine the enclosing class even in files
+    with multiple classes (nested or sequential).
+    """
+    class_stack: List[Tuple[str, int]] = []  # (class_name, depth_at_open_brace)
+    depth = 0
+    result: Dict[int, Tuple[str, str]] = {}
+    for lineno, line in enumerate(lines, 1):
+        opens = line.count("{")
+        closes = line.count("}")
+        # Pop classes whose scope has ended
+        depth += opens - closes
+        while class_stack and depth <= class_stack[-1][1]:
+            class_stack.pop()
+        cls_m = _CLASS_DECL_RE.match(line)
+        if cls_m:
+            # Record depth before opens on this line as the class's outer depth
+            class_stack.append((cls_m.group(1), depth - opens))
+        meth_m = method_re.match(line)
+        if meth_m and class_stack:
+            result[lineno] = (class_stack[-1][0], meth_m.group(1))
+    return result
+
+
+def _extract_changed_method_owners(
+    file_abs: Path,
+    base_ref: Optional[str],
+    use_working_tree: bool,
+    git_root: Path,
+    method_re: re.Pattern,
+) -> List[Tuple[str, str]]:
+    """Return (class_name, method_name) pairs for methods with at least one changed line."""
+    try:
+        rel = str(file_abs.relative_to(git_root))
+    except ValueError:
+        return []
+    effective_base = base_ref if base_ref else "HEAD~1"
+    cmd = (
+        ["git", "diff", "--unified=0", "--", rel]
+        if use_working_tree
+        else ["git", "diff", "--unified=0", effective_base, "--", rel]
+    )
+    try:
+        diff_out = subprocess.check_output(
+            cmd, cwd=str(git_root), stderr=subprocess.DEVNULL, text=True
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return []
+
+    changed_ranges: List[Tuple[int, int]] = []
+    for m in _HUNK_HEADER_RE.finditer(diff_out):
+        start = int(m.group(1))
+        count = int(m.group(2)) if m.group(2) is not None else 1
+        if count > 0:
+            changed_ranges.append((start, start + count - 1))
+    if not changed_ranges:
+        return []
+
+    try:
+        lines = file_abs.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+    owners = _find_method_owners(lines, method_re)
+    if not owners:
+        return []
+
+    line_nos = sorted(owners)
+    found: Set[Tuple[str, str]] = set()
+    for rng_start, rng_end in changed_ranges:
+        idx = bisect.bisect_right(line_nos, rng_start) - 1
+        if idx >= 0:
+            found.add(owners[line_nos[idx]])
+        lo = bisect.bisect_left(line_nos, rng_start)
+        hi = bisect.bisect_right(line_nos, rng_end)
+        for i in range(lo, hi):
+            found.add(owners[line_nos[i]])
+    return sorted(found)
+
+
+def _find_test_methods_in_cache(
+    source_methods: List[str],
+    test_class: str,
+    cache: Dict[Path, str],
+    method_re: re.Pattern,
+) -> List[str]:
+    """Return test method names whose names contain any source method name (case-insensitive)."""
+    needles = [m.lower() for m in source_methods]
+    class_pat = re.compile(r'\bclass\s+' + re.escape(test_class) + r'\b')
+    found: List[str] = []
+    seen: Set[str] = set()
+    for content in cache.values():
+        if not class_pat.search(content):
+            continue
+        for line in content.splitlines():
+            m = method_re.match(line)
+            if m:
+                name = m.group(1)
+                if name in seen:
+                    continue
+                if any(needle in name.lower() for needle in needles):
+                    found.append(name)
+                    seen.add(name)
+    return found
+
+
 def assess(
     root: Path,
     git_root: Path,
@@ -1396,6 +1533,7 @@ def assess(
     head_ref: str = "HEAD",
     strategy: str = "hybrid",
     use_working_tree: bool = False,
+    staged_only: bool = False,
     adapter: Optional[LanguageAdapter] = None,
 ) -> ImpactResult:
     """Run the full test impact assessment."""
@@ -1405,7 +1543,10 @@ def assess(
     notes: List[str] = [f"Language adapter: {adapter.language}"]
 
     # ── 1. Collect changes ────────────────────────────────────────────────
-    if use_working_tree:
+    if staged_only:
+        changes = get_changed_files_working_tree(git_root, staged_only=True)
+        notes.append("Comparing staged changes only")
+    elif use_working_tree:
         changes = get_changed_files_working_tree(git_root)
         notes.append("Comparing against working tree (staged + unstaged)")
     elif base_ref:
@@ -1492,6 +1633,8 @@ def assess(
 
     def _handle_source(change: FileChange) -> None:
         found_tests: Set[Path] = set()
+        local_classes: Set[str] = set()
+        is_test_file_change = False  # True when the changed file lives in a test project
 
         for analysis_path in change.analysis_paths():
             owner, test_paths = strategy_dependency_graph(
@@ -1501,42 +1644,77 @@ def assess(
                 # is_test_file(): .NET always True; Java uses "src/test/"; Node uses .test./.spec.
                 is_test = owner.is_test_project and adapter.is_test_file(analysis_path)
                 if is_test:
+                    is_test_file_change = True
                     found_tests.add(owner.path)
                     fp = (git_root / change.path).resolve()
-                    if fp.exists():
+                    if fp.exists() and not change.is_deleted:
                         try:
                             content = fp.read_text(encoding="utf-8", errors="replace")
                             test_classes = adapter.extract_test_identifiers(fp, content)
                             m_re = adapter.method_decl_re
-                            if m_re and len(test_classes) == 1 and not change.is_deleted:
-                                changed_methods = _extract_changed_methods(
+                            if m_re:
+                                owners = _extract_changed_method_owners(
                                     fp, base_ref, use_working_tree, git_root, m_re
                                 )
-                                if changed_methods:
-                                    cls = test_classes[0]
-                                    for mth in changed_methods:
-                                        affected_classes.add(f"{cls}.{mth}")
+                                # Keep only owners whose class is a known test class
+                                test_class_set = set(test_classes)
+                                matched = [
+                                    (cls, mth)
+                                    for cls, mth in owners
+                                    if cls in test_class_set
+                                ]
+                                if matched:
+                                    for cls, mth in matched:
+                                        local_classes.add(f"{cls}.{mth}")
                                 else:
-                                    affected_classes.update(test_classes)
+                                    local_classes.update(test_classes)
                             else:
-                                affected_classes.update(test_classes)
+                                local_classes.update(test_classes)
                         except OSError:
                             pass
                 else:
                     affected_source_names.add(owner.name)
                     found_tests.update(test_paths)
 
-        if strategy in ("convention", "hybrid"):
-            for proj_path, cls in adapter.strategy_convention(change, tp):
-                found_tests.add(proj_path)
-                affected_classes.add(cls)
+        if not is_test_file_change:
+            if strategy in ("convention", "hybrid"):
+                for proj_path, cls in adapter.strategy_convention(change, tp):
+                    found_tests.add(proj_path)
+                    local_classes.add(cls)
 
-        if strategy in ("symbol", "hybrid"):
-            for proj_path, cls in adapter.strategy_symbol_search(
-                change, tp, git_root, test_file_cache
-            ):
-                found_tests.add(proj_path)
-                affected_classes.add(cls)
+            if strategy in ("symbol", "hybrid"):
+                for proj_path, cls in adapter.strategy_symbol_search(
+                    change, tp, git_root, test_file_cache
+                ):
+                    found_tests.add(proj_path)
+                    local_classes.add(cls)
+
+        # Source method → test method convention: when a source method changes,
+        # try to narrow class-level entries to specific test methods by name.
+        m_re = adapter.method_decl_re
+        if m_re and local_classes and not change.is_deleted and not is_test_file_change:
+            fp = (git_root / change.path).resolve()
+            if fp.exists():
+                src_methods = _extract_changed_methods(
+                    fp, base_ref, use_working_tree, git_root, m_re
+                )
+                if src_methods:
+                    refined: Set[str] = set()
+                    for cls in local_classes:
+                        if "." in cls:
+                            refined.add(cls)
+                            continue
+                        test_meths = _find_test_methods_in_cache(
+                            src_methods, cls, test_file_cache, m_re
+                        )
+                        if test_meths:
+                            for mth in test_meths:
+                                refined.add(f"{cls}.{mth}")
+                        else:
+                            refined.add(cls)
+                    local_classes = refined
+
+        affected_classes.update(local_classes)
 
         if found_tests:
             affected_test_paths.update(found_tests)
@@ -1644,7 +1822,7 @@ def fmt_human(result: ImpactResult) -> str:
         "  TEST IMPACT ANALYSIS",
         sep,
         f"  Language: {result.language}",
-        f"  Status  : {'RUN ALL TESTS' if result.run_all else 'Targeted run'}",
+        f"  Status  : {'RUN ALL TESTS' if result.run_all and not result.test_filter else 'Targeted run'}",
         f"  Reason  : {result.reason}",
         sep,
     ]
@@ -1707,12 +1885,14 @@ def fmt_github_actions(result: ImpactResult) -> str:
         "has_tests": str(bool(result.test_project_paths or result.run_all)).lower(),
         "test_project_paths": ",".join(result.test_project_paths),
     }
-    lines = [f'echo "{k}={v}" >> $GITHUB_OUTPUT' for k, v in simple.items()]
+    # shlex.quote ensures values with spaces, quotes, or special chars are safe.
+    lines = [f"echo {shlex.quote(f'{k}={v}')} >> $GITHUB_OUTPUT" for k, v in simple.items()]
     cmd = result.test_command
+    # Heredoc syntax for multi-line / quote-containing test_command value.
     lines += [
-        'echo "test_command<<__GHA_EOF__" >> $GITHUB_OUTPUT',
-        f'echo "{cmd}" >> $GITHUB_OUTPUT',
-        'echo "__GHA_EOF__" >> $GITHUB_OUTPUT',
+        'printf "test_command<<__GHA_EOF__\\n" >> $GITHUB_OUTPUT',
+        f'printf "%s\\n" {shlex.quote(cmd)} >> $GITHUB_OUTPUT',
+        'printf "__GHA_EOF__\\n" >> $GITHUB_OUTPUT',
     ]
     return "\n".join(lines)
 
@@ -1817,6 +1997,10 @@ examples:
         help="Analyse working-tree changes (staged + unstaged) instead of a git diff",
     )
     parser.add_argument(
+        "--staged", action="store_true",
+        help="Analyse only staged (indexed) changes — useful before committing",
+    )
+    parser.add_argument(
         "extra_args", nargs=argparse.REMAINDER,
         help="Arguments forwarded to the test runner (after --) when --run is used",
     )
@@ -1842,6 +2026,7 @@ def main() -> None:
         head_ref=args.head,
         strategy=args.strategy,
         use_working_tree=args.unstaged,
+        staged_only=args.staged,
         adapter=adapter,
     )
 
