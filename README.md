@@ -205,7 +205,42 @@ opentia --base HEAD~1 --root sample-app --output azure-devops
 
 ## CI integration
 
-### GitHub Actions
+### Covering all commits in a PR (branch promotion)
+
+When merging a feature branch or promoting across environments (`dev → staging → main`), a PR may contain many commits. Use `--base` pointed at the **target branch** — opentia analyses the combined diff of every commit in the PR at once, so no change slips through.
+
+```bash
+# All changes between this branch and main, in one diff
+opentia --base origin/main --root . --output github-actions
+```
+
+In GitHub Actions, use the PR base SHA that GitHub provides:
+
+```yaml
+on:
+  pull_request:
+    branches: [main, staging]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # required — shallow clones may not have the base commit
+
+      - name: Test Impact Analysis
+        id: tia
+        run: opentia --base ${{ github.event.pull_request.base.sha }} --root . --output github-actions
+
+      - name: Run affected tests
+        if: steps.tia.outputs.has_tests == 'true'
+        run: ${{ steps.tia.outputs.dotnet_command }}
+```
+
+> **Why `fetch-depth: 0`?** By default `actions/checkout` does a shallow clone. If the base commit is not present locally, `git diff` fails. `fetch-depth: 0` fetches the full history so the base SHA is always reachable.
+
+### GitHub Actions (push to branch)
 
 ```yaml
 - name: Test Impact Analysis
@@ -222,7 +257,7 @@ Available outputs: `test_filter`, `run_all`, `has_tests`, `test_project_paths`, 
 ### Azure DevOps
 
 ```yaml
-- script: opentia --base $(System.PullRequest.TargetBranch) --root sample-app --output azure-devops
+- script: opentia --base $(System.PullRequest.TargetBranchName) --root sample-app --output azure-devops
   displayName: Test Impact Analysis
 
 - script: $(dotnetCommand)
