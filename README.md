@@ -26,6 +26,12 @@ pip install opentia
 
 This installs the `opentia` command on your `PATH`.
 
+## Publishing to PyPI
+
+```bash
+python -m build && twine upload dist/* --username __token__ --password pypi-YOUR_TOKEN
+```
+
 ---
 
 ## Quick start

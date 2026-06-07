@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opentia"
-version = "1.0.2"
+version = "1.0.4"
 description = "Test Impact Analysis for C# / .NET — selects only tests affected by a git diff. Java and Node.js support planned."
 readme = "README.md"
 requires-python = ">=3.8"
