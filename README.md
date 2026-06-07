@@ -1,8 +1,10 @@
-# Test Impact Analysis — C# / .NET
+# opentia — Test Impact Analysis
 
 Analyses a git diff and selects only the tests whose execution path could have been affected by the change. Skips the full suite on every push.
 
 **No external dependencies** — Python 3.8+ stdlib only.
+
+**Language support:** C# / .NET is fully supported. Java (Maven/Gradle) and Node.js support are planned for future releases.
 
 ---
 
