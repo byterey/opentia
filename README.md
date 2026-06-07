@@ -18,17 +18,27 @@ Analyses a git diff and selects only the tests whose execution path could have b
 
 ---
 
+## Installation
+
+```bash
+pip install opentia
+```
+
+This installs the `opentia` command on your `PATH`.
+
+---
+
 ## Quick start
 
 ```bash
 # Analyse the last commit against the one before it
-python assess_impact.py --base HEAD~1 --root <path-to-your-solution>
+opentia --base HEAD~1 --root <path-to-your-solution>
 
 # Analyse uncommitted (staged + unstaged) changes — no commit needed
-python assess_impact.py --unstaged --root <path-to-your-solution>
+opentia --unstaged --root <path-to-your-solution>
 
 # Analyse and immediately run the selected tests
-python assess_impact.py --base HEAD~1 --root <path-to-your-solution> --run
+opentia --base HEAD~1 --root <path-to-your-solution> --run
 ```
 
 `--root` is where the `.sln` / `.csproj` files live. It does not need to be the git root — the script locates the actual git root automatically via `git rev-parse --show-toplevel`.
@@ -68,7 +78,7 @@ Each scenario tests a distinct behaviour. Use `--unstaged` to avoid committing:
 
 ```bash
 echo "# change" >> sample-app/.gitignore
-python assess_impact.py --unstaged --root sample-app
+opentia --unstaged --root sample-app
 # Expected: no tests to run (file type is ignored)
 git checkout sample-app/.gitignore
 ```
@@ -77,7 +87,7 @@ git checkout sample-app/.gitignore
 
 ```bash
 echo "// change" >> sample-app/src/SampleApp.Services/PricingService.cs
-python assess_impact.py --unstaged --root sample-app
+opentia --unstaged --root sample-app
 # Expected: SampleApp.Services.Tests only, filtered to PricingServiceTests
 git checkout sample-app/src/SampleApp.Services/PricingService.cs
 ```
@@ -86,7 +96,7 @@ git checkout sample-app/src/SampleApp.Services/PricingService.cs
 
 ```bash
 echo "// change" >> sample-app/src/SampleApp.Core/Utilities/MathHelper.cs
-python assess_impact.py --unstaged --root sample-app
+opentia --unstaged --root sample-app
 # Expected: SampleApp.Core.Tests AND SampleApp.Services.Tests
 # Services.Tests is included because Services depends on Core (BFS)
 git checkout sample-app/src/SampleApp.Core/Utilities/MathHelper.cs
@@ -96,7 +106,7 @@ git checkout sample-app/src/SampleApp.Core/Utilities/MathHelper.cs
 
 ```bash
 echo " " >> sample-app/SampleApp.sln
-python assess_impact.py --unstaged --root sample-app
+opentia --unstaged --root sample-app
 # Expected: run_all = true, all test projects
 git checkout sample-app/SampleApp.sln
 ```
@@ -133,7 +143,7 @@ git checkout sample-app/SampleApp.sln
 ## Usage reference
 
 ```
-python assess_impact.py [OPTIONS] [-- DOTNET_ARGS]
+opentia [OPTIONS] [-- DOTNET_ARGS]
 
   --base REF      Git ref to diff against (e.g. HEAD~1, main, origin/main)
   --head REF      Head ref to diff from (default: HEAD)
@@ -158,16 +168,16 @@ python assess_impact.py [OPTIONS] [-- DOTNET_ARGS]
 
 ```bash
 # Human-readable (default)
-python assess_impact.py --base HEAD~1 --root sample-app
+opentia --base HEAD~1 --root sample-app
 
 # JSON — pipe into scripts or CI steps
-python assess_impact.py --base HEAD~1 --root sample-app --output json
+opentia --base HEAD~1 --root sample-app --output json
 
 # GitHub Actions — prints `echo "key=value" >> $GITHUB_OUTPUT` lines
-python assess_impact.py --base HEAD~1 --root sample-app --output github-actions
+opentia --base HEAD~1 --root sample-app --output github-actions
 
 # Azure DevOps — prints `##vso[task.setvariable ...]` lines
-python assess_impact.py --base HEAD~1 --root sample-app --output azure-devops
+opentia --base HEAD~1 --root sample-app --output azure-devops
 ```
 
 ### JSON output fields
@@ -194,7 +204,7 @@ python assess_impact.py --base HEAD~1 --root sample-app --output azure-devops
 ```yaml
 - name: Test Impact Analysis
   id: tia
-  run: python assess_impact.py --base ${{ github.event.before }} --root sample-app --output github-actions
+  run: opentia --base ${{ github.event.before }} --root sample-app --output github-actions
 
 - name: Run affected tests
   if: steps.tia.outputs.has_tests == 'true'
@@ -206,7 +216,7 @@ Available outputs: `test_filter`, `run_all`, `has_tests`, `test_project_paths`, 
 ### Azure DevOps
 
 ```yaml
-- script: python assess_impact.py --base $(System.PullRequest.TargetBranch) --root sample-app --output azure-devops
+- script: opentia --base $(System.PullRequest.TargetBranch) --root sample-app --output azure-devops
   displayName: Test Impact Analysis
 
 - script: $(dotnetCommand)
