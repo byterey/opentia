@@ -11,6 +11,18 @@ SCRIPT = REPO / "assess_impact.py"
 PASS = FAIL = 0
 
 
+def _stash() -> bool:
+    r = subprocess.run(["git", "stash", "--include-untracked", "-m", "tia-selftest"], cwd=str(REPO), capture_output=True, text=True)
+    return "No local changes" not in r.stdout
+
+
+def _stash_pop():
+    subprocess.run(["git", "stash", "pop"], cwd=str(REPO), capture_output=True)
+
+
+_stashed = _stash()
+
+
 def tia(extra_args=()):
     r = subprocess.run(
         [sys.executable, str(SCRIPT), "--unstaged", "--root", str(APP), "--output", "json", *extra_args],
@@ -172,4 +184,8 @@ check("Clean working tree → no tests to run", result, no_tests=True)
 print(f"\n{'─'*60}")
 print(f"  {PASS} passed  |  {FAIL} failed  |  {PASS+FAIL} total")
 print(f"{'─'*60}")
+
+if _stashed:
+    _stash_pop()
+
 sys.exit(0 if FAIL == 0 else 1)
