@@ -144,20 +144,24 @@ print("\n── Config / unknown file types ────────────
 cfg = APP / "src/MultiApp.Application/appsettings.json"
 cfg.write_text('{ "key": "value" }', encoding="utf-8")
 git_add(cfg)
-result = tia()
-check("Config .json (Application) → Application.Tests or run_all", result,
-      expect_projects=["MultiApp.Application.Tests"], exact=False)
-git_rm_cached(cfg)
-cfg.unlink()
+try:
+    result = tia()
+    check("Config .json (Application) → Application.Tests or run_all", result,
+          expect_projects=["MultiApp.Application.Tests"], exact=False)
+finally:
+    git_rm_cached(cfg)
+    cfg.unlink(missing_ok=True)
 
 # unknown extension → safe run_all fallback
 unk = APP / "src/MultiApp.Domain/readme.xyz"
 unk.write_text("unknown", encoding="utf-8")
 git_add(unk)
-result = tia()
-check("Unknown file type (.xyz) → run_all", result, run_all=True)
-git_rm_cached(unk)
-unk.unlink()
+try:
+    result = tia()
+    check("Unknown file type (.xyz) → run_all", result, run_all=True)
+finally:
+    git_rm_cached(unk)
+    unk.unlink(missing_ok=True)
 
 print("\n── No changes ────────────────────────────────────────────────────────")
 

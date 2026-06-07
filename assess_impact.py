@@ -21,7 +21,7 @@ Usage:
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.0.4"
 
 import abc
 import argparse
@@ -191,13 +191,24 @@ def _parse_name_status(out: str) -> List[FileChange]:
     return changes
 
 
+_GIT_REF_RE = re.compile(r'^[A-Za-z0-9_./:@^~{}\[\]\\-]{1,250}$')
+
+
+def _validate_ref(ref: str, name: str) -> str:
+    if not _GIT_REF_RE.match(ref):
+        print(f"[ERROR] Invalid git ref for {name}: {ref!r}", file=sys.stderr)
+        sys.exit(1)
+    return ref
+
+
 def get_changed_files(
     base_ref: str, head_ref: str = "HEAD", git_root: Optional[Path] = None,
 ) -> List[FileChange]:
     try:
         out = _run_git(
             "diff", "--name-status", "--diff-filter=DACMRT",
-            base_ref, head_ref, cwd=git_root,
+            _validate_ref(base_ref, "--base"), _validate_ref(head_ref, "--head"),
+            "--", cwd=git_root,
         )
         return _parse_name_status(out)
     except subprocess.CalledProcessError as exc:
@@ -1899,6 +1910,10 @@ def fmt_github_actions(result: ImpactResult) -> str:
     return "\n".join(lines)
 
 
+def _ado_escape(v: str) -> str:
+    return v.replace("%", "%AZP25").replace("]", "%5D").replace("\r", "").replace("\n", "")
+
+
 def fmt_azure_devops(result: ImpactResult) -> str:
     vars_ = {
         "language": result.language,
@@ -1909,7 +1924,8 @@ def fmt_azure_devops(result: ImpactResult) -> str:
         "testCommand": result.test_command,
     }
     return "\n".join(
-        f"echo '##vso[task.setvariable variable={k}]{v}'" for k, v in vars_.items()
+        f"echo '##vso[task.setvariable variable={k}]{_ado_escape(v)}'"
+        for k, v in vars_.items()
     )
 
 
