@@ -4,7 +4,7 @@ using MultiApp.Domain.Enums;
 namespace MultiApp.Domain.Services;
 
 public class OrderDomainService
-{ //change
+{ //chang
     public decimal CalculateTotal(Order order) => order.Total;
 
     public bool CanTransitionTo(Order order, OrderStatus target) => (order.Status, target) switch
