@@ -10,8 +10,8 @@ venv/
 *.egg-info/
 
 # .NET build output
-sample-app/**/bin/
-sample-app/**/obj/
-sample-app/**/.vs/
-sample-app/**/*.user
-sample-app/**/*.suo
+**/bin/
+**/obj/
+**/.vs/
+**/*.user
+**/*.suo
