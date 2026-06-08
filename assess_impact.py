@@ -324,7 +324,7 @@ def strategy_dependency_graph(
     if not owner:
         return None, set()
     if owner.is_test_project:
-        return owner, {owner.path}
+        return owner, {owner.path} | reverse_deps.get(owner.path, set())
     return owner, reverse_deps.get(owner.path, set())
 
 
