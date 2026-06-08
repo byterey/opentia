@@ -1,0 +1,2 @@
+batch:
+  schedule: "0 * * * *"
