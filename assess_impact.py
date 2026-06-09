@@ -1749,6 +1749,7 @@ def assess(
         if owner:
             if owner.is_test_project:
                 affected_test_paths.add(owner.path)
+                affected_test_paths.update(reverse_deps.get(owner.path, set()))
             else:
                 affected_source_names.add(owner.name)
                 affected_test_paths.update(reverse_deps.get(owner.path, set()))
