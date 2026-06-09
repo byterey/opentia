@@ -761,7 +761,9 @@ class JavaAdapter(LanguageAdapter):
             pfx = f"{{{ns}}}" if ns else ""
 
             def _find_text(tag: str) -> Optional[str]:
-                el = root_el.find(f"{pfx}{tag}") or root_el.find(tag)
+                el = root_el.find(f"{pfx}{tag}")
+                if el is None:
+                    el = root_el.find(tag)
                 return (el.text or "").strip() if el is not None else None
 
             artifact = _find_text("artifactId")
@@ -769,8 +771,12 @@ class JavaAdapter(LanguageAdapter):
                 name = artifact
 
             for dep in list(root_el.iter(f"{pfx}dependency")) + list(root_el.iter("dependency")):
-                art_el = dep.find(f"{pfx}artifactId") or dep.find("artifactId")
-                scope_el = dep.find(f"{pfx}scope") or dep.find("scope")
+                art_el = dep.find(f"{pfx}artifactId")
+                if art_el is None:
+                    art_el = dep.find("artifactId")
+                scope_el = dep.find(f"{pfx}scope")
+                if scope_el is None:
+                    scope_el = dep.find("scope")
                 art = (art_el.text or "").lower().strip() if art_el is not None else ""
                 scope = (scope_el.text or "").lower().strip() if scope_el is not None else ""
                 if art in _JAVA_TEST_PACKAGES or scope == "test":
