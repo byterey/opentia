@@ -292,8 +292,6 @@ def build_reverse_deps(projects: List[Project]) -> Dict[Path, Set[Path]]:
 
     dependents: Dict[Path, Set[Path]] = {p.path: set() for p in projects}
     for proj in projects:
-        if proj.is_test_project:
-            continue
         for ref_name in proj.project_references:
             for ref_proj in _find_by_name(projects, ref_name):
                 dependents[ref_proj.path].add(proj.path)
