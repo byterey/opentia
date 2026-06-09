@@ -770,7 +770,10 @@ class JavaAdapter(LanguageAdapter):
             if artifact:
                 name = artifact
 
-            for dep in list(root_el.iter(f"{pfx}dependency")) + list(root_el.iter("dependency")):
+            deps_el = root_el.find(f"{pfx}dependencies")
+            if deps_el is None:
+                deps_el = root_el.find("dependencies")
+            for dep in (list(deps_el) if deps_el is not None else []):
                 art_el = dep.find(f"{pfx}artifactId")
                 if art_el is None:
                     art_el = dep.find("artifactId")
