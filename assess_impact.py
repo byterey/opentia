@@ -37,7 +37,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +65,12 @@ EXCLUDED_DIRS: Tuple[str, ...] = (
     "node_modules", "dist", ".next", ".nuxt", "coverage",  # Node
     ".git", ".idea", "packages", ".nuget",
 )
+
+# Node adapter uses this instead of EXCLUDED_DIRS so that npm workspace
+# directories named "packages" are not silently skipped.
+_NODE_EXCLUDED_DIRS: FrozenSet[str] = frozenset(
+    EXCLUDED_DIRS
+) - {"packages"}
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +248,10 @@ def get_changed_files_working_tree(
 
 def _excluded(path: Path) -> bool:
     return any(part in EXCLUDED_DIRS for part in path.parts)
+
+
+def _node_excluded(path: Path) -> bool:
+    return any(part in _NODE_EXCLUDED_DIRS for part in path.parts)
 
 
 def _find_owner(projects: List[Project], file_abs: Path) -> Optional[Project]:
@@ -1132,7 +1142,7 @@ class NodeAdapter(LanguageAdapter):
 
         for pkg in sorted(root.rglob("package.json")):
             resolved = pkg.resolve()
-            if _excluded(resolved) or resolved in seen:
+            if _node_excluded(resolved) or resolved in seen:
                 continue
             seen.add(resolved)
             projects.append(self._parse_package_json(resolved))
@@ -1149,7 +1159,7 @@ class NodeAdapter(LanguageAdapter):
                         self.is_test_file(str(f))
                         for ext in self._SOURCE_EXTS
                         for f in proj.directory.rglob(f"*{ext}")
-                        if not _excluded(f)
+                        if not _node_excluded(f)
                     )
                     if has_tests:
                         proj.is_test_project = True
@@ -1166,7 +1176,7 @@ class NodeAdapter(LanguageAdapter):
         for proj in test_projects:
             for ext in self._SOURCE_EXTS:
                 for f in proj.directory.rglob(f"*{ext}"):
-                    if _excluded(f):
+                    if _node_excluded(f):
                         continue
                     if self.is_test_file(str(f)) and f not in cache:
                         try:
@@ -1295,7 +1305,7 @@ class NodeAdapter(LanguageAdapter):
             proj_test_ids: Set[str] = set()
             for ext in self._SOURCE_EXTS:
                 for f in proj.directory.rglob(f"*{ext}"):
-                    if not _excluded(f) and self.is_test_file(str(f)):
+                    if not _node_excluded(f) and self.is_test_file(str(f)):
                         proj_test_ids.add(f.stem)
             if proj_test_ids and not proj_test_ids.intersection(result):
                 result.update(proj_test_ids)
