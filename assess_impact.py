@@ -397,6 +397,16 @@ class LanguageAdapter(abc.ABC):
         """
         return True
 
+    def fill_missing_test_classes(
+        self,
+        affected_test_paths: Set[Path],
+        affected_classes: Set[str],
+        projects: List[Project],
+    ) -> Set[str]:
+        """For transitively-affected test projects with no specific class entry,
+        optionally inject all their test IDs. Default: no-op."""
+        return affected_classes
+
     # Set to a compiled regex in subclasses to enable method-level precision.
     # Must capture the method name in group 1.
     method_decl_re: Optional[re.Pattern] = None
@@ -1111,8 +1121,14 @@ class NodeAdapter(LanguageAdapter):
         workspace_files: List[Path] = []
 
         root_pkg = root / "package.json"
+        is_workspace_root = False
         if root_pkg.exists():
             workspace_files.append(root_pkg.resolve())
+            try:
+                data = json.loads(root_pkg.read_text(encoding="utf-8", errors="replace"))
+                is_workspace_root = bool(data.get("workspaces"))
+            except (json.JSONDecodeError, OSError):
+                pass
 
         for pkg in sorted(root.rglob("package.json")):
             resolved = pkg.resolve()
@@ -1120,6 +1136,23 @@ class NodeAdapter(LanguageAdapter):
                 continue
             seen.add(resolved)
             projects.append(self._parse_package_json(resolved))
+
+        if is_workspace_root:
+            root_resolved = root_pkg.resolve()
+            for proj in projects:
+                if proj.path == root_resolved:
+                    # workspace root is the runner, not a test project itself
+                    proj.is_test_project = False
+                elif not proj.is_test_project:
+                    # mark sub-package as test project if it owns test files
+                    has_tests = any(
+                        self.is_test_file(str(f))
+                        for ext in self._SOURCE_EXTS
+                        for f in proj.directory.rglob(f"*{ext}")
+                        if not _excluded(f)
+                    )
+                    if has_tests:
+                        proj.is_test_project = True
 
         # Single-package repo: mark the only project as test-capable
         if projects and not any(p.is_test_project for p in projects):
@@ -1245,6 +1278,29 @@ class NodeAdapter(LanguageAdapter):
     def prefer_run_all_when_all_affected(self) -> bool:
         return False  # always use --testPathPattern; npx jest alone runs everything
 
+    def fill_missing_test_classes(
+        self,
+        affected_test_paths: Set[Path],
+        affected_classes: Set[str],
+        projects: List[Project],
+    ) -> Set[str]:
+        """For workspace packages transitively affected but with no specific class entry,
+        inject all test IDs from those packages so the filter covers them."""
+        path_to_proj = {p.path: p for p in projects}
+        result = set(affected_classes)
+        for test_path in affected_test_paths:
+            proj = path_to_proj.get(test_path)
+            if proj is None:
+                continue
+            proj_test_ids: Set[str] = set()
+            for ext in self._SOURCE_EXTS:
+                for f in proj.directory.rglob(f"*{ext}"):
+                    if not _excluded(f) and self.is_test_file(str(f)):
+                        proj_test_ids.add(f.stem)
+            if proj_test_ids and not proj_test_ids.intersection(result):
+                result.update(proj_test_ids)
+        return result
+
     def _detect_runner(self, result: ImpactResult) -> str:
         for pkg_path in result.test_project_paths + result.workspace_files:
             try:
@@ -1265,6 +1321,12 @@ class NodeAdapter(LanguageAdapter):
         self, result: ImpactResult, extra_args: List[str], cwd: Optional[Path],
     ) -> int:
         runner = self._detect_runner(result)
+        # Always run from workspace root when available; fall back to first test project dir
+        run_dir = (
+            Path(result.workspace_files[0]).parent if result.workspace_files
+            else Path(result.test_project_paths[0]).parent if result.test_project_paths
+            else cwd
+        )
         if result.run_all:
             cmd = (
                 ["npx", "vitest", "run", *extra_args]
@@ -1272,32 +1334,26 @@ class NodeAdapter(LanguageAdapter):
                 else ["npx", "jest", *extra_args]
             )
             print(f"\n[RUN] {' '.join(cmd)}\n")
-            return subprocess.call(cmd, cwd=str(cwd) if cwd else None)
+            return subprocess.call(cmd, cwd=str(run_dir) if run_dir else None)
 
         if not result.test_project_paths:
             print("[INFO] No tests to run.", file=sys.stderr)
             return 0
 
-        code = 0
-        for pkg_path in result.test_project_paths:
-            pkg_dir = Path(pkg_path).parent
-            if runner == "vitest":
-                cmd = (
-                    ["npx", "vitest", "run", result.test_filter, *extra_args]
-                    if result.test_filter
-                    else ["npx", "vitest", "run", *extra_args]
-                )
-            else:
-                cmd = (
-                    ["npx", "jest", f"--testPathPattern={result.test_filter}", *extra_args]
-                    if result.test_filter
-                    else ["npx", "jest", *extra_args]
-                )
-            print(f"\n[RUN] {' '.join(cmd)}\n")
-            rc = subprocess.call(cmd, cwd=str(pkg_dir))
-            if rc != 0:
-                code = rc
-        return code
+        if runner == "vitest":
+            cmd = (
+                ["npx", "vitest", "run", result.test_filter, *extra_args]
+                if result.test_filter
+                else ["npx", "vitest", "run", *extra_args]
+            )
+        else:
+            cmd = (
+                ["npx", "jest", f"--testPathPattern={result.test_filter}", *extra_args]
+                if result.test_filter
+                else ["npx", "jest", *extra_args]
+            )
+        print(f"\n[RUN] {' '.join(cmd)}\n")
+        return subprocess.call(cmd, cwd=str(run_dir) if run_dir else None)
 
     def fmt_command(self, result: ImpactResult) -> str:
         runner = self._detect_runner(result)
@@ -1306,18 +1362,9 @@ class NodeAdapter(LanguageAdapter):
             return base
         if not result.test_project_paths:
             return "(no tests to run)"
-        parts = []
-        for _ in result.test_project_paths:
-            if runner == "vitest":
-                parts.append(
-                    f'{base} "{result.test_filter}"' if result.test_filter else base
-                )
-            else:
-                parts.append(
-                    f'{base} --testPathPattern="{result.test_filter}"'
-                    if result.test_filter else base
-                )
-        return " && ".join(parts)
+        if runner == "vitest":
+            return f'{base} "{result.test_filter}"' if result.test_filter else base
+        return f'{base} --testPathPattern="{result.test_filter}"' if result.test_filter else base
 
 
 # ---------------------------------------------------------------------------
@@ -1779,12 +1826,17 @@ def assess(
         )
         affected_test_paths = {p.path for p in tp}
 
-    # ── 11. Prefer method-level over class-level when both exist ─────────
+    # ── 11. Fill missing test classes for transitively-affected projects ─
+    affected_classes = adapter.fill_missing_test_classes(
+        affected_test_paths, affected_classes, projects
+    )
+
+    # ── 12. Prefer method-level over class-level when both exist ─────────
     if any("." in c for c in affected_classes):
         covered = {c.rsplit(".", 1)[0] for c in affected_classes if "." in c}
         affected_classes = {c for c in affected_classes if "." in c or c not in covered}
 
-    # ── 12. Build filter ──────────────────────────────────────────────────
+    # ── 13. Build filter ──────────────────────────────────────────────────
     run_all_triggered = (
         bool(tp)
         and adapter.prefer_run_all_when_all_affected()
