@@ -324,13 +324,29 @@ print("\n── Android (Kotlin, nested Gradle modules) ────────
 
 AND = REPO / "android-app"
 
-# Nested project(":core:model") refs must resolve so dependents run
+# Nested project(":core:model") refs must resolve so dependents run, and
+# gradle tasks must use the full module path (:core:model:test, not :model:test)
 and_src = AND / "core/model/src/main/java/com/example/core/model/Money.kt"
 orig = patch(and_src)
 try:
     result = tia(root=AND)
     check("Kotlin core change → model + checkout + app (nested refs)", result,
           expect_projects=["model", "checkout", "app"], exact=True)
+    # Per-module filters: each gradle task carries only its own classes —
+    # a --tests pattern matching nothing fails the task
+    cmd = result.get("test_command", "")
+    ok = (
+        ':core:model:test --tests="MoneyTest' in cmd
+        and ':feature:checkout:test --tests="CheckoutEngineTest"' in cmd
+        and './gradlew :app:test &&' in cmd          # plain: no foreign classes
+    )
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] Nested task paths + per-module filters")
+    if not ok:
+        print(f"         test_command: {cmd}")
 finally:
     restore(and_src, orig)
 

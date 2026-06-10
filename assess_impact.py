@@ -979,7 +979,9 @@ class JavaAdapter(LanguageAdapter):
                 if any(pkg in coord for pkg in _JAVA_TEST_PACKAGES):
                     is_test = True
                     break
-            for m in re.finditer(r"project\s*\(\s*['\"]?:?([\w\-/.]+)['\"]?\s*\)", content):
+            # Module paths may be nested (":core:model") — ':' must be part
+            # of the captured path.
+            for m in re.finditer(r"project\s*\(\s*['\"]:?([\w\-/.:]+)['\"]\s*\)", content):
                 dep = m.group(1).lstrip(":").replace(":", "/")
                 if dep not in refs:
                     refs.append(dep)
@@ -1009,12 +1011,34 @@ class JavaAdapter(LanguageAdapter):
         if root_pom.exists():
             workspace_files.append(root_pom)
 
+        gradle_projects: List[Project] = []
         for gradle in gradles:
             resolved = gradle.resolve()
             if resolved in seen:
                 continue
             seen.add(resolved)
-            projects.append(self._parse_gradle(resolved))
+            proj = self._parse_gradle(resolved)
+            projects.append(proj)
+            gradle_projects.append(proj)
+
+        # Resolve project(":a:b") refs to build-file paths relative to the
+        # gradle root. Name matching can't see nested module paths (the
+        # project name is just the directory name); unresolved refs keep
+        # their name for fallback matching.
+        for proj in gradle_projects:
+            remaining: List[str] = []
+            for ref in proj.project_references:
+                cand_dir = root.joinpath(*ref.split("/"))
+                for bf_name in ("build.gradle", "build.gradle.kts"):
+                    cand = cand_dir / bf_name
+                    if cand.exists():
+                        rp = cand.resolve()
+                        if rp not in proj.reference_paths:
+                            proj.reference_paths.append(rp)
+                        break
+                else:
+                    remaining.append(ref)
+            proj.project_references = remaining
 
         for sf in ("settings.gradle", "settings.gradle.kts"):
             sf_path = root / sf
@@ -1139,24 +1163,44 @@ class JavaAdapter(LanguageAdapter):
         d = Path(proj_path).parent
         return (d / "build.gradle").exists() or (d / "build.gradle.kts").exists()
 
-    def _split_instrumented(
+    def _gradle_module_path(self, proj_path: str) -> str:
+        """Gradle path of the module (e.g. 'core:model') — the directory path
+        relative to the settings.gradle root, colon-joined. Empty string for
+        the root module; module dir name when no settings file is found."""
+        d = Path(proj_path).parent
+        cur = d
+        while True:
+            if (cur / "settings.gradle").exists() or (cur / "settings.gradle.kts").exists():
+                return ":".join(d.relative_to(cur).parts)
+            if cur.parent == cur:
+                return d.name
+            cur = cur.parent
+
+    def _module_classes(
         self, proj_path: str, classes: Set[str],
     ) -> Tuple[Set[str], Set[str]]:
-        """Split class filters into (unit, instrumented) — instrumented test
-        classes live under src/androidTest and need the connectedAndroidTest
-        task (device/emulator) instead of the JVM test task."""
-        at_names: Set[str] = set()
+        """Scope class filters to this module and split into (unit,
+        instrumented). The global filter set spans every affected module; a
+        filter naming a class from another module would fail the task. A
+        class is assigned by which of the module's test dirs holds its file;
+        instrumented classes (src/androidTest) need the connectedAndroidTest
+        task. Classes matching neither dir are dropped for this module —
+        callers fall back to the module's full suite when nothing remains."""
         proj_dir = Path(proj_path).parent
-        for sub in ("src/androidTest/java", "src/androidTest/kotlin"):
-            d = proj_dir / sub.replace("/", os.sep)
-            if d.exists():
-                at_names.update(
-                    f.stem for f in _iter_files(d, suffixes=self._SOURCE_EXTS)
-                )
-        if not at_names:
-            return set(classes), set()
-        instr = {c for c in classes if c.split(".")[0] in at_names}
-        return set(classes) - instr, instr
+        unit_names: Set[str] = set()
+        instr_names: Set[str] = set()
+        for td_rel in self._TEST_DIR_RELS:
+            d = proj_dir / td_rel.replace("/", os.sep)
+            if not d.exists():
+                continue
+            names = {f.stem for f in _iter_files(d, suffixes=self._SOURCE_EXTS)}
+            if "androidTest" in td_rel:
+                instr_names |= names
+            else:
+                unit_names |= names
+        unit = {c for c in classes if c.split(".")[0] in unit_names}
+        instr = {c for c in classes if c.split(".")[0] in instr_names}
+        return unit, instr
 
     def _has_gradlew(self, cwd: Optional[Path]) -> bool:
         base = cwd or Path(".")
@@ -1186,24 +1230,37 @@ class JavaAdapter(LanguageAdapter):
             cmds: List[List[str]] = []
             if is_gradle:
                 gradle = "./gradlew" if self._has_gradlew(cwd) else "gradle"
+                mp = self._gradle_module_path(proj_path)
+                test_task = f":{mp}:test" if mp else "test"
+                connected_task = f":{mp}:connectedAndroidTest" if mp else "connectedAndroidTest"
                 if result.test_filter:
-                    unit, instr = self._split_instrumented(
+                    unit, instr = self._module_classes(
                         proj_path, result.affected_test_classes
                     )
                     if unit:
                         cmds.append([
-                            gradle, f":{module_name}:test",
+                            gradle, test_task,
                             *(f"--tests={c}" for c in sorted(unit)), *extra_args,
                         ])
                     if instr:
                         cmds.append([
-                            gradle, f":{module_name}:connectedAndroidTest",
+                            gradle, connected_task,
                             *(f"--tests={c}" for c in sorted(instr)), *extra_args,
                         ])
                 if not cmds:
-                    cmds.append([gradle, f":{module_name}:test", *extra_args])
+                    cmds.append([gradle, test_task, *extra_args])
             else:
-                filter_args = [f"-Dtest={result.test_filter}"] if result.test_filter else []
+                filter_args: List[str] = []
+                if result.test_filter:
+                    unit, _ = self._module_classes(
+                        proj_path, result.affected_test_classes
+                    )
+                    if unit:
+                        surefire = ",".join(
+                            c.replace(".", "#", 1) if "." in c else c
+                            for c in sorted(unit)
+                        )
+                        filter_args = [f"-Dtest={surefire}"]
                 cmds.append(["mvn", "test", "-pl", f":{module_name}", *filter_args, *extra_args])
             for cmd in cmds:
                 print(f"\n[RUN] {' '.join(cmd)}\n")
@@ -1223,22 +1280,35 @@ class JavaAdapter(LanguageAdapter):
             module_name = Path(proj_path).parent.name
             gradle = self._is_gradle_project(proj_path)
             if gradle:
+                mp = self._gradle_module_path(proj_path)
+                test_task = f":{mp}:test" if mp else "test"
+                connected_task = f":{mp}:connectedAndroidTest" if mp else "connectedAndroidTest"
                 if result.test_filter:
-                    unit, instr = self._split_instrumented(
+                    unit, instr = self._module_classes(
                         proj_path, result.affected_test_classes
                     )
                     if unit:
                         filters = " ".join(f'--tests="{c}"' for c in sorted(unit))
-                        parts.append(f'./gradlew :{module_name}:test {filters}')
+                        parts.append(f'./gradlew {test_task} {filters}')
                     if instr:
                         filters = " ".join(f'--tests="{c}"' for c in sorted(instr))
-                        parts.append(
-                            f'./gradlew :{module_name}:connectedAndroidTest {filters}'
-                        )
+                        parts.append(f'./gradlew {connected_task} {filters}')
+                    if not unit and not instr:
+                        parts.append(f'./gradlew {test_task}')
                 else:
-                    parts.append(f'./gradlew :{module_name}:test')
+                    parts.append(f'./gradlew {test_task}')
             else:
-                filter_str = f' -Dtest="{result.test_filter}"' if result.test_filter else ""
+                filter_str = ""
+                if result.test_filter:
+                    unit, _ = self._module_classes(
+                        proj_path, result.affected_test_classes
+                    )
+                    if unit:
+                        surefire = ",".join(
+                            c.replace(".", "#", 1) if "." in c else c
+                            for c in sorted(unit)
+                        )
+                        filter_str = f' -Dtest="{surefire}"'
                 parts.append(f'mvn test -pl ":{module_name}"{filter_str}')
         return " && ".join(parts)
 
