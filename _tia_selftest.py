@@ -272,6 +272,57 @@ finally:
     restore(fs_ts, o1)
     restore(fs_java, o2)
 
+print("\n── Name-collision workspaces ─────────────────────────────────────────")
+
+# Two C# apps with same-stem Core.csproj: ProjectReference must resolve by
+# path, so AppB's tests must not run for an AppA change.
+CA = REPO / "collision-app"
+ca_src = CA / "AppA/Core/Calculator.cs"
+orig = patch(ca_src)
+try:
+    result = tia(root=CA)
+    check("C# same-stem projects → AppA tests only", result,
+          expect_projects=["AppA.Core.Tests"], exact=True)
+finally:
+    restore(ca_src, orig)
+
+# Two Maven apps with colliding 'core' artifactIds under different groupIds:
+# dependency matching must be groupId-qualified.
+JCA = REPO / "java-collision-app"
+jca_src = JCA / "appa/core/src/main/java/com/appa/core/Order.java"
+orig = patch(jca_src)
+try:
+    result = tia(root=JCA)
+    actual = set(result.get("affected_test_projects", []))
+    paths_ok = not any(
+        "appb" in p.replace("\\", "/") for p in result.get("test_project_paths", [])
+    )
+    ok = actual == {"core", "appa-services"} and paths_ok
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] Maven colliding artifactIds → appa modules only")
+    if not ok:
+        print(f"         actual_projects   : {sorted(actual)}")
+        print(f"         appb excluded     : {paths_ok}")
+finally:
+    restore(jca_src, orig)
+
+print("\n── Plain-version workspace deps (pnpm/lerna style) ───────────────────")
+
+# Internal dep declared with a plain semver range (no workspace:/file:
+# protocol) and workspace defined only in pnpm-workspace.yaml.
+NPM = REPO / "node-plain-mono"
+np_src = NPM / "packages/core/src/pricing.ts"
+orig = patch(np_src)
+try:
+    result = tia(root=NPM)
+    check("Plain semver internal dep → dependent package selected", result,
+          expect_projects=["@plain/core", "@plain/services"], exact=True)
+finally:
+    restore(np_src, orig)
+
 print("\n── No changes ────────────────────────────────────────────────────────")
 
 result = tia()

@@ -122,6 +122,10 @@ class Project:
     path: Path           # path to the project/build file
     is_test_project: bool = False
     project_references: List[str] = field(default_factory=list)
+    # Resolved build-file paths of referenced projects (exact, no name
+    # collisions). Used before project_references name matching.
+    reference_paths: List[Path] = field(default_factory=list)
+    group_id: str = ""   # Maven groupId for qualified artifact matching
 
     @property
     def directory(self) -> Path:
@@ -296,9 +300,36 @@ def _is_under(child: Path, parent: Path) -> bool:
 
 
 def _find_by_name(projects: List[Project], name: str) -> List[Project]:
-    """Return projects whose name or build-file stem matches (case-insensitive)."""
+    """Return projects whose name or build-file stem matches (case-insensitive).
+    A 'group:artifact' qualified name matches group_id + artifact when targets
+    declare a group; falls back to artifact-only matching otherwise."""
+    if ":" in name:
+        group, _, artifact = name.partition(":")
+        gl, al = group.lower(), artifact.lower()
+        hits = [
+            p for p in projects
+            if (p.name.lower() == al or p.path.stem.lower() == al)
+            and p.group_id and p.group_id.lower() == gl
+        ]
+        if hits:
+            return hits
+        name = artifact
     nl = name.lower()
     return [p for p in projects if p.name.lower() == nl or p.path.stem.lower() == nl]
+
+
+def _ref_targets(
+    proj: Project, projects: List[Project], by_path: Dict[Path, Project],
+) -> List[Project]:
+    """Resolve a project's references: exact path matches first, then names."""
+    targets: List[Project] = []
+    for ref_path in proj.reference_paths:
+        target = by_path.get(ref_path)
+        if target:
+            targets.append(target)
+    for ref_name in proj.project_references:
+        targets.extend(_find_by_name(projects, ref_name))
+    return targets
 
 
 # ---------------------------------------------------------------------------
@@ -310,19 +341,19 @@ def build_reverse_deps(projects: List[Project]) -> Dict[Path, Set[Path]]:
     Return {source_project_path: set_of_test_project_paths}.
     BFS-transitive: if B depends on A, and TestB tests B, then A changing → TestB runs.
     """
+    by_path: Dict[Path, Project] = {p.path: p for p in projects}
+
     direct: Dict[Path, Set[Path]] = {p.path: set() for p in projects}
     for proj in projects:
         if not proj.is_test_project:
             continue
-        for ref_name in proj.project_references:
-            for ref_proj in _find_by_name(projects, ref_name):
-                direct[ref_proj.path].add(proj.path)
+        for ref_proj in _ref_targets(proj, projects, by_path):
+            direct[ref_proj.path].add(proj.path)
 
     dependents: Dict[Path, Set[Path]] = {p.path: set() for p in projects}
     for proj in projects:
-        for ref_name in proj.project_references:
-            for ref_proj in _find_by_name(projects, ref_name):
-                dependents[ref_proj.path].add(proj.path)
+        for ref_proj in _ref_targets(proj, projects, by_path):
+            dependents[ref_proj.path].add(proj.path)
 
     result: Dict[Path, Set[Path]] = {path: set(testers) for path, testers in direct.items()}
     for source_path in [p.path for p in projects]:
@@ -575,9 +606,21 @@ class DotNetAdapter(LanguageAdapter):
                 if (elem.text or "").strip().lower() == "true":
                     proj.is_test_project = True
             for ref in xml_root.iter("ProjectReference"):
-                stem = Path(ref.get("Include", "").replace("\\", "/")).stem
-                if stem and stem not in proj.project_references:
-                    proj.project_references.append(stem)
+                include = (ref.get("Include") or "").strip().replace("\\", "/")
+                if not include:
+                    continue
+                try:
+                    ref_path = (path.parent / include).resolve()
+                except OSError:
+                    ref_path = None
+                if ref_path is not None and ref_path.exists():
+                    if ref_path not in proj.reference_paths:
+                        proj.reference_paths.append(ref_path)
+                else:
+                    # MSBuild variables etc. — fall back to stem matching
+                    stem = Path(include).stem
+                    if stem and stem not in proj.project_references:
+                        proj.project_references.append(stem)
             for pkg in xml_root.iter("PackageReference"):
                 if pkg.get("Include", "").lower().strip() in _DOTNET_TEST_PACKAGES:
                     proj.is_test_project = True
@@ -804,6 +847,7 @@ class JavaAdapter(LanguageAdapter):
         name = pom_path.parent.name
         is_test = False
         refs: List[str] = []
+        group = ""
 
         if (pom_path.parent / "src" / "test" / "java").exists():
             is_test = True
@@ -825,6 +869,19 @@ class JavaAdapter(LanguageAdapter):
             if artifact:
                 name = artifact
 
+            group = _find_text("groupId") or ""
+            if not group:
+                # groupId is commonly inherited from <parent>
+                parent_el = root_el.find(f"{pfx}parent")
+                if parent_el is None:
+                    parent_el = root_el.find("parent")
+                if parent_el is not None:
+                    g_el = parent_el.find(f"{pfx}groupId")
+                    if g_el is None:
+                        g_el = parent_el.find("groupId")
+                    if g_el is not None:
+                        group = (g_el.text or "").strip()
+
             deps_el = root_el.find(f"{pfx}dependencies")
             if deps_el is None:
                 deps_el = root_el.find("dependencies")
@@ -835,16 +892,26 @@ class JavaAdapter(LanguageAdapter):
                 scope_el = dep.find(f"{pfx}scope")
                 if scope_el is None:
                     scope_el = dep.find("scope")
+                g_el = dep.find(f"{pfx}groupId")
+                if g_el is None:
+                    g_el = dep.find("groupId")
                 art = (art_el.text or "").lower().strip() if art_el is not None else ""
                 scope = (scope_el.text or "").lower().strip() if scope_el is not None else ""
+                dep_group = (g_el.text or "").lower().strip() if g_el is not None else ""
+                if dep_group in ("${project.groupid}", "${pom.groupid}"):
+                    dep_group = group.lower()
                 if art in _JAVA_TEST_PACKAGES or scope == "test":
                     is_test = True
-                if art and art not in refs:
-                    refs.append(art)
+                ref = f"{dep_group}:{art}" if dep_group else art
+                if art and ref not in refs:
+                    refs.append(ref)
         except (ET.ParseError, OSError):
             pass
 
-        return Project(name=name, path=pom_path, is_test_project=is_test, project_references=refs)
+        return Project(
+            name=name, path=pom_path, is_test_project=is_test,
+            project_references=refs, group_id=group,
+        )
 
     def _parse_gradle(self, gradle_path: Path) -> Project:
         name = gradle_path.parent.name
@@ -1121,7 +1188,7 @@ class NodeAdapter(LanguageAdapter):
         ".babelrc", ".babelrc.js",
         "eslint.config.js", ".eslintrc", ".eslintrc.js", ".eslintrc.json",
         ".prettierrc", ".prettierrc.js", ".prettierrc.json",
-        "nx.json", "turbo.json", "lerna.json",
+        "nx.json", "turbo.json", "lerna.json", "pnpm-workspace.yaml",
     )
     _CONFIG_EXTS: Tuple[str, ...] = (".json", ".yaml", ".yml", ".env", ".toml")
 
@@ -1149,25 +1216,29 @@ class NodeAdapter(LanguageAdapter):
             return ChangeCategory.CONFIG
         return ChangeCategory.UNKNOWN
 
-    def _parse_package_json(self, pkg_path: Path) -> Project:
+    def _parse_package_json(self, pkg_path: Path) -> Tuple[Project, Set[str]]:
+        """Returns (project, all_dependency_names). Dependency names are used
+        by discover() to wire plain-version internal deps to sibling packages."""
         name = pkg_path.parent.name
         is_test = False
         refs: List[str] = []
+        dep_names: Set[str] = set()
         try:
             data = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
             name = data.get("name", name) or name
-            dev = {k.lower() for k in data.get("devDependencies", {})}
-            deps = {k.lower() for k in data.get("dependencies", {})}
-            if any(r in dev | deps for r in _NODE_TEST_RUNNERS):
+            all_deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+            dep_names = set(all_deps)
+            if any(r in {k.lower() for k in all_deps} for r in _NODE_TEST_RUNNERS):
                 is_test = True
             if "test" in (data.get("scripts") or {}):
                 is_test = True
-            for dep, ver in {**data.get("dependencies", {}), **data.get("devDependencies", {})}.items():
+            for dep, ver in all_deps.items():
                 if str(ver).startswith(("workspace:", "file:")):
                     refs.append(dep)
         except (json.JSONDecodeError, OSError):
             pass
-        return Project(name=name, path=pkg_path, is_test_project=is_test, project_references=refs)
+        proj = Project(name=name, path=pkg_path, is_test_project=is_test, project_references=refs)
+        return proj, dep_names
 
     def discover(self, root: Path) -> Tuple[List[Project], List[Path]]:
         seen: Set[Path] = set()
@@ -1183,7 +1254,11 @@ class NodeAdapter(LanguageAdapter):
                 is_workspace_root = bool(data.get("workspaces"))
             except (json.JSONDecodeError, OSError):
                 pass
+        # pnpm and lerna define the workspace outside package.json
+        if (root / "pnpm-workspace.yaml").exists() or (root / "lerna.json").exists():
+            is_workspace_root = True
 
+        parsed: List[Tuple[Project, Set[str]]] = []
         for pkg in sorted(_iter_files(
             root, filenames=frozenset({"package.json"}), excluded=_NODE_EXCLUDED_DIRS,
         )):
@@ -1191,7 +1266,20 @@ class NodeAdapter(LanguageAdapter):
             if resolved in seen:
                 continue
             seen.add(resolved)
-            projects.append(self._parse_package_json(resolved))
+            parsed.append(self._parse_package_json(resolved))
+        projects = [proj for proj, _ in parsed]
+
+        # Internal deps declared with plain version ranges (lerna / classic
+        # yarn): wire an edge when the dep name matches a sibling package.
+        package_names = {p.name for p in projects}
+        for proj, dep_names in parsed:
+            for dep in dep_names:
+                if (
+                    dep in package_names
+                    and dep != proj.name
+                    and dep not in proj.project_references
+                ):
+                    proj.project_references.append(dep)
 
         if is_workspace_root:
             root_resolved = root_pkg.resolve()
