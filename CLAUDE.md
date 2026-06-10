@@ -84,9 +84,11 @@ Never: delete a failing test, change an assertion to match broken output, mark a
 
 ## What this repo is
 
-A **Test Impact Analysis (TIA)** tool for C# / .NET projects. Given a git diff, `assess_impact.py` selects only the tests whose execution path could have been affected by the change — avoiding a full suite run on every push.
+A **multi-language Test Impact Analysis (TIA)** tool, published to PyPI as `opentia`. Given a git diff, `assess_impact.py` selects only the tests whose execution path could have been affected by the change — avoiding a full suite run on every push.
 
-The `sample-app/` directory is a self-contained C# solution used to verify the script against realistic dependency scenarios.
+Supported ecosystems via `LanguageAdapter` subclasses: **C# / .NET** (`.sln`/`.csproj`), **Java** (Maven + Gradle), **Node.js** (Jest / Vitest / npm test scripts; npm, pnpm, and lerna workspaces). Polyglot repos are handled in one run — changes are partitioned to the adapter owning their nearest build-file ancestor.
+
+The repo contains tracked validation apps (see *Validation apps* below) and a scenario harness, `_tia_selftest.py`.
 
 ## Running the script
 
@@ -97,7 +99,7 @@ python assess_impact.py --base HEAD~1 --root sample-app
 # Analyse unstaged/staged working-tree changes (no commit needed)
 python assess_impact.py --unstaged --root sample-app
 
-# Analyse AND immediately run dotnet test
+# Analyse AND immediately run the selected tests
 python assess_impact.py --base HEAD~1 --root sample-app --run
 
 # Machine-readable output for CI scripting
@@ -107,11 +109,22 @@ python assess_impact.py --base HEAD~1 --root sample-app --output json
 python assess_impact.py --base HEAD~1 --root sample-app --output github-actions
 python assess_impact.py --base HEAD~1 --root sample-app --output azure-devops
 
-# Pass extra flags to dotnet test
+# Force one adapter in a polyglot repo (default: auto-detect all)
+python assess_impact.py --base HEAD~1 --root java-fullstack-app --lang java
+
+# Pass extra flags to the test runner
 python assess_impact.py --base HEAD~1 --root sample-app --run -- --no-build --verbosity minimal
 ```
 
-`--root` is the directory searched for `.sln` / `.csproj` files. It does not need to be the git repo root — the script detects the actual git root via `git rev-parse --show-toplevel` independently.
+`--root` is the directory searched for build files. It does not need to be the git repo root — the script detects the actual git root via `git rev-parse --show-toplevel` independently. **Changes outside `--root` are ignored** (with a strategy note), they do not trigger fallback runs.
+
+## Running the scenario harness
+
+```bash
+python _tia_selftest.py   # all TIA scenarios against the validation apps
+```
+
+**Important:** the harness stashes the working tree (including untracked files) before running and pops afterwards — so it always exercises the **committed** `assess_impact.py`, not uncommitted edits. When developing: verify changes with direct `--unstaged` invocations first, commit, then run the harness.
 
 ## Running the sample-app tests
 
@@ -139,71 +152,81 @@ The script has no external dependencies — stdlib only. The pipeline on every i
 ```
 git diff (--name-status)
     ↓
-FileChange list  ─── classify_change() ──→  INFRA | IGNORED | CS_SOURCE | CONFIG | UNKNOWN
+detect_adapters()            every ecosystem under --root (priority: dotnet > java > node)
     ↓
-discover_projects()          parse .sln → .csproj (merged with glob; excludes obj/bin)
-    ↓
-build_reverse_deps()         BFS-transitive graph: {source_path → set[test_paths]}
-    ↓
-build_test_file_cache()      pre-load all test .cs files into memory once
-    ↓
+partition_changes()          polyglot only: route each file to the adapter owning its
+                             nearest build-file ancestor; unowned files → all adapters
+    ↓  per adapter — assess():
+root scoping                 drop changes outside --root (with a note)
+adapter.classify()           INFRA | IGNORED | SOURCE | CONFIG | UNKNOWN
+adapter.discover()           parse build files (pruned walk via _iter_files —
+                             node_modules/obj/bin/target skipped during descent)
+build_reverse_deps()         BFS-transitive graph: {source_path → set[test_paths]};
+                             refs resolved by path (.NET), group:artifact (Maven),
+                             package name (Node — incl. plain-version internal deps)
+adapter.build_test_file_cache()
 per-file analysis loop
   ├─ strategy_dependency_graph()   project ownership → reverse dependency lookup
   ├─ strategy_convention()         FooService → FooServiceTests (both old+new paths for renames)
-  └─ strategy_symbol_search()      extract public types → grep cached test files
+  ├─ strategy_symbol_search()      extract public types → grep cached test files
+  └─ method-level refinement       changed source methods → matching test methods by name
+adapter.build_filter()       runner-specific filter (capped at 40 identifiers)
     ↓
-build_filter()               "FullyQualifiedName~A|FullyQualifiedName~B" (capped at 40 classes)
-    ↓
-ImpactResult → formatter → stdout
+ImpactResult per adapter → formatter → stdout
+                             (CI formats merge multi-language results; json adds
+                              a `results` array when >1 language)
 ```
 
 ### File classification rules (in priority order)
 
-| Category | Trigger | Behaviour |
+| Category | Trigger (per adapter) | Behaviour |
 |---|---|---|
-| `INFRA` | `.sln`, `.csproj`, `global.json`, `nuget.config`, `Directory.Build.*` | Run all test projects |
+| `INFRA` | build files: `.sln`/`.csproj`, `pom.xml`/`build.gradle`, `package.json`, tool configs | **Tiered:** workspace-level → run all; module-level build file → scope via dependency graph and drop class-level filters |
 | `IGNORED` | `.md`, images, archives; dotfiles: `.gitignore`, `.editorconfig` | Skip — no tests |
-| `CS_SOURCE` | `.cs` | Full 3-strategy analysis |
-| `CONFIG` | `.json`, `.xml`, `.yaml`, `.resx`, `.razor`, `.cshtml`, etc. | Find owning project, run its tests |
+| `SOURCE` | `.cs` / `.java` `.kt` / `.ts` `.js` etc. | Full 3-strategy analysis |
+| `CONFIG` | `.json`, `.xml`, `.yaml`, `.resx`, `.razor`, `.properties`, etc. | Find owning project, run its tests + dependents |
 | `UNKNOWN` | Anything else | Run all tests (safe fallback) |
+
+Workspace-level = `.sln`, root/parent `pom.xml`, `settings.gradle`, root `package.json`, `pnpm-workspace.yaml`, `global.json`, `Directory.Build.*`. Module-level = a discovered project's own build file.
 
 ### Safe fallback chain
 
 When targeted selection fails, the script escalates rather than silently skipping tests:
-1. Unmatched `.cs` file → run all test projects
+1. Unmatched source file → run all test projects
 2. Source project changed but nothing in the dependency graph covers it → run all test projects
 3. Config file with no owning project → run all test projects
 
 ### Key data structures
 
 - `FileChange(path, old_path, status)` — renames carry both paths; `analysis_paths()` returns both for renames so convention + dependency graph fire against the old name too.
-- `CSharpProject(name, path, is_test_project, project_references)` — `project_references` holds stem names (what appears in `<ProjectReference Include="...">`).
-- `ImpactResult` — the unified output consumed by all formatters and the test runner.
+- `Project(name, path, is_test_project, project_references, reference_paths, group_id)` — `reference_paths` holds resolved build-file paths (exact, collision-proof; .NET); `project_references` holds names (`group:artifact` qualified for Maven, package names for Node); `group_id` is the Maven groupId.
+- `LanguageAdapter` (ABC) — per-ecosystem: `detect`, `has_build_file` (polyglot routing), `classify`, `discover`, the two name-based strategies, `build_filter`, `run_tests`, `fmt_command`.
+- `ImpactResult` — the unified output consumed by all formatters and the test runner; `_merge_results()` collapses multi-language results for the flat CI formats.
 - `reverse_deps: Dict[Path, Set[Path]]` — maps each source project path to the set of test project paths that should run when it changes (BFS-resolved).
 
-### Test project detection (in order)
+### Test project detection
 
-1. Explicit `<IsTestProject>true</IsTestProject>` in the csproj
-2. Any known test NuGet package (`xunit`, `nunit`, `mstest.testadapter`, `moq`, `fluentassertions`, etc.)
-3. Project name ends with `.Tests`, `.Test`, `.Specs`, `.Spec` (case-insensitive)
+- **.NET:** `<IsTestProject>true</IsTestProject>` → known test NuGet package (`xunit`, `nunit`, `moq`, …) → name ends `.Tests`/`.Test`/`.Specs`/`.Spec`.
+- **Java:** `src/test/java|kotlin` exists, or a test-scoped / known test dependency (`junit`, `mockito`, …). Mixed modules (source + tests in one module) are normal; `is_test_file()` (`src/test/` in path) distinguishes within the module.
+- **Node:** jest/vitest/jasmine in deps or a `test` script; in workspaces, sub-packages owning `.test.`/`.spec.`/`__tests__` files. The workspace root itself is the runner, never a test project.
 
-## Sample-app dependency graph
+## Validation apps
 
-```
-SampleApp.Core          (no deps)
-    ↑
-SampleApp.Services      (→ Core)
-    ↑
-SampleApp.Api           (→ Services)   [no test project]
-
-SampleApp.Core.Tests    tests Core      (92 tests)
-SampleApp.Services.Tests tests Services (60 tests)
-```
-
-**Implication:** changing anything in `Core` triggers **both** test projects (transitive BFS). Changing `Services` only triggers `Services.Tests`.
+| App | Shape | Exercises |
+|---|---|---|
+| `sample-app/` | C# 3-layer + 2 test projects | transitive BFS (Core → both test projects) |
+| `multi-app/` | C# 4-layer diamond | layer isolation; `_tia_selftest.py` default target |
+| `java-sample-app/` | single Maven module | single-module behaviour |
+| `java-multi-app/` | Maven 4-module diamond | Java mixed modules, transitive deps |
+| `java-fullstack-app/` | Maven backend + Angular frontend | polyglot routing, karma `npm test` fallback |
+| `node-sample-app/` | single npm package | single-package Node |
+| `node-mono-app/` | npm workspaces (`workspace:*` deps) | workspace dependency graph |
+| `node-plain-mono/` | pnpm-style (plain-version internal deps, hoisted jest) | pnpm/lerna detection, name-matched dep edges |
+| `collision-app/` | two C# apps, same-stem `Core.csproj` | path-based ProjectReference resolution |
+| `java-collision-app/` | two Maven apps, colliding `core` artifactIds | group:artifact qualified matching |
 
 ## Extending to other languages
 
-The script is structured so each language needs only its own `discover_projects()` equivalent and three strategy functions. The git analysis, file classification, output formatting, and CI integration layers are language-agnostic.
+Subclass `LanguageAdapter`, implement its abstract methods (plus `has_build_file` for polyglot routing), and append an instance to `_ADAPTERS`. The git analysis, change partitioning, fallback escalation, output formatting, and CI integration layers are language-agnostic.
 
-The `ChangeCategory` enum and the fallback escalation chain in `assess()` are the two places that would need to handle new file extensions.
+Add a validation app for the new ecosystem and scenarios to `_tia_selftest.py` — every adapter behaviour in this repo is specified by a harness scenario first.

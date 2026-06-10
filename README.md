@@ -4,7 +4,7 @@ Analyses a git diff and selects only the tests whose execution path could have b
 
 **No external dependencies** — Python 3.8+ stdlib only.
 
-**Language support:** C# / .NET is fully supported. Java (Maven/Gradle) and Node.js support are planned for future releases.
+**Language support:** C# / .NET, Java (Maven / Gradle), and Node.js (Jest / Vitest / npm test scripts — single packages, npm/pnpm/lerna workspaces). Mixed-language repos are handled in a single run: changes are routed to the right ecosystem automatically.
 
 ---
 
@@ -12,9 +12,8 @@ Analyses a git diff and selects only the tests whose execution path could have b
 
 | Tool | Version | Purpose |
 |---|---|---|
-| Python | 3.8+ | Run the script |
+| Python | 3.8+ | Run opentia |
 | Git | any | Diff source |
-| .NET SDK | 8.0+ | Build and run `sample-app` tests |
 
 ---
 
@@ -26,164 +25,56 @@ pip install opentia
 
 This installs the `opentia` command on your `PATH`.
 
-## Publishing to PyPI
-
-```bash
-python -m build && twine upload dist/* --username __token__ --password pypi-YOUR_TOKEN
-```
-
 ---
 
 ## Quick start
 
 ```bash
-# Analyse the last commit against the one before it
-opentia --base HEAD~1 --root <path-to-your-solution>
+# Analyse the last commit
+opentia --base HEAD~1 --root <path-to-your-project>
 
 # Analyse uncommitted (staged + unstaged) changes — no commit needed
-opentia --unstaged --root <path-to-your-solution>
+opentia --unstaged --root <path-to-your-project>
 
 # Analyse and immediately run the selected tests
-opentia --base HEAD~1 --root <path-to-your-solution> --run
+opentia --base HEAD~1 --root <path-to-your-project> --run
 ```
 
-`--root` is where the `.sln` / `.csproj` files live. It does not need to be the git root — the script locates the actual git root automatically via `git rev-parse --show-toplevel`.
-
----
-
-## Validating the script with sample-app
-
-`sample-app/` is a self-contained C# solution purpose-built to verify the script against realistic dependency scenarios.
-
-### Dependency graph
-
-```
-SampleApp.Core       (no deps)             ← 92 tests in SampleApp.Core.Tests
-        ↑
-SampleApp.Services   (depends on Core)     ← 60 tests in SampleApp.Services.Tests
-        ↑
-SampleApp.Api        (depends on Services)   [no test project]
-```
-
-**Key implication:** changing anything in `Core` triggers **both** test projects because `Services` depends on `Core` — the BFS propagates transitively.
-
-### Step 1 — Confirm baseline
-
-```bash
-cd sample-app
-dotnet test SampleApp.sln
-# Expected: 152 passed, 0 failed
-cd ..
-```
-
-### Step 2 — Run validation scenarios
-
-Each scenario tests a distinct behaviour. Use `--unstaged` to avoid committing:
-
-**Scenario 1 — Ignored file → no tests selected**
-
-```bash
-echo "# change" >> sample-app/.gitignore
-opentia --unstaged --root sample-app
-# Expected: no tests to run (file type is ignored)
-git checkout sample-app/.gitignore
-```
-
-**Scenario 2 — Services-only change → only `Services.Tests`**
-
-```bash
-echo "// change" >> sample-app/src/SampleApp.Services/PricingService.cs
-opentia --unstaged --root sample-app
-# Expected: SampleApp.Services.Tests only, filtered to PricingServiceTests
-git checkout sample-app/src/SampleApp.Services/PricingService.cs
-```
-
-**Scenario 3 — Core change → both test projects (transitive)**
-
-```bash
-echo "// change" >> sample-app/src/SampleApp.Core/Utilities/MathHelper.cs
-opentia --unstaged --root sample-app
-# Expected: SampleApp.Core.Tests AND SampleApp.Services.Tests
-# Services.Tests is included because Services depends on Core (BFS)
-git checkout sample-app/src/SampleApp.Core/Utilities/MathHelper.cs
-```
-
-**Scenario 4 — Infrastructure change → all tests forced**
-
-```bash
-echo " " >> sample-app/SampleApp.sln
-opentia --unstaged --root sample-app
-# Expected: run_all = true, all test projects
-git checkout sample-app/SampleApp.sln
-```
-
-### Step 3 — Read the output
-
-```
-──────────────────────────────────────────────────────────────────
-  TEST IMPACT ANALYSIS
-──────────────────────────────────────────────────────────────────
-  Status  : Targeted run            ← "RUN ALL TESTS" means a fallback was triggered
-  Affected test projects (1):
-    • SampleApp.Services.Tests
-  Affected test classes (1):
-    • PricingServiceTests
-  dotnet command:
-    dotnet test "...SampleApp.Services.Tests.csproj" --filter "FullyQualifiedName~PricingServiceTests"
-──────────────────────────────────────────────────────────────────
-```
-
-`Status: Targeted run` means the script selected a subset. `Status: RUN ALL TESTS` means it fell back to running everything (expected for Scenario 4).
-
-### Additional scenarios
-
-| File to change | Expected result |
-|---|---|
-| `src/SampleApp.Core/Models/Product.cs` | Both test projects, filtered to `ProductTests` + dependent service tests |
-| `tests/SampleApp.Core.Tests/Utilities/StringHelperTests.cs` | `Core.Tests` only, filtered to `StringHelperTests` |
-| `src/SampleApp.Services/appsettings.json` | `Services.Tests`, no class filter (config file) |
-| `src/SampleApp.Services/SampleApp.Services.csproj` | All tests, `run_all = true` (infra file) |
+`--root` is where your `.sln` / `.csproj` / `pom.xml` / `build.gradle` / `package.json` lives. It does not need to be the git root — opentia locates the actual git root automatically.
 
 ---
 
 ## Usage reference
 
 ```
-opentia [OPTIONS] [-- DOTNET_ARGS]
+opentia [OPTIONS] [-- TEST_ARGS]
 
   --base REF      Git ref to diff against (e.g. HEAD~1, main, origin/main)
   --head REF      Head ref to diff from (default: HEAD)
-  --root DIR      Directory containing .sln / .csproj files (default: .)
+  --root DIR      Directory containing project files (default: .)
+  --lang LANG     Force one adapter: dotnet | java | node (default: auto-detect all)
   --strategy      project | convention | symbol | hybrid (default: hybrid)
   --output, -o    human | json | github-actions | azure-devops (default: human)
-  --run           Execute dotnet test after analysis
-  --unstaged      Analyse working-tree changes instead of a git diff
-  --              Everything after this is forwarded to dotnet test
+  --run           Execute the test command after analysis
+  --unstaged      Analyse working-tree changes (staged + unstaged)
+  --staged        Analyse only staged changes — useful before committing
+  --              Everything after this is forwarded to the test runner
 ```
-
-### Strategies
-
-| Strategy | What it does |
-|---|---|
-| `project` | Parse `.sln`/`.csproj` to find which test projects reference the changed source project (BFS-transitive through the dependency graph) |
-| `convention` | `FooService.cs` → look for `FooServiceTests.cs`, `FooServiceTest.cs`, `TestFooService.cs` |
-| `symbol` | Extract `public class/interface/enum` names from the changed file; grep all test `.cs` files for references |
-| `hybrid` | All three combined (default) |
 
 ### Output formats
 
 ```bash
 # Human-readable (default)
-opentia --base HEAD~1 --root sample-app
+opentia --base HEAD~1 --root .
 
 # JSON — pipe into scripts or CI steps
-opentia --base HEAD~1 --root sample-app --output json
+opentia --base HEAD~1 --root . --output json
 
-# GitHub Actions — prints `echo "key=value" >> $GITHUB_OUTPUT` lines
-opentia --base HEAD~1 --root sample-app --output github-actions
+# GitHub Actions
+opentia --base HEAD~1 --root . --output github-actions
 
-# Azure DevOps — prints `##vso[task.setvariable ...]` lines
-opentia --base HEAD~1 --root sample-app --output azure-devops
+# Azure DevOps
+opentia --base HEAD~1 --root . --output azure-devops
 ```
 
 ### JSON output fields
@@ -191,30 +82,47 @@ opentia --base HEAD~1 --root sample-app --output azure-devops
 ```jsonc
 {
   "run_all": false,               // true = targeted selection was abandoned
+  "language": "dotnet",          // dotnet | java | node
   "test_filter": "FullyQualifiedName~PricingServiceTests",
   "test_project_paths": ["...SampleApp.Services.Tests.csproj"],
   "affected_test_projects": ["SampleApp.Services.Tests"],
   "affected_test_classes": ["PricingServiceTests"],
-  "dotnet_command": "dotnet test \"...\" --filter \"...\"",
+  "test_command": "dotnet test \"...\" --filter \"...\"",
   "reason": "Analysis complete",
   "strategy_notes": []            // warnings / fallback explanations
 }
 ```
 
+When changes span multiple ecosystems in one run, the same fields are emitted merged at the top level (`language: "java,node"`, `test_command` joined with `&&`) plus a `results` array containing one full per-language object each.
+
+---
+
+## Node.js projects
+
+opentia detects Jest and Vitest automatically. For **workspaces** (npm `workspaces`, `pnpm-workspace.yaml`, or `lerna.json`), each sub-package is analysed independently and the dependency graph is resolved across internal references — `workspace:*`, `file:`, **and plain version ranges** that match a sibling package name. Changing a shared package triggers tests in every package that depends on it.
+
+The test command is a single `npx jest` (or `npx vitest run`) invocation run from the workspace root with a test-path-pattern filter. Packages without jest/vitest but with a `test` script (karma, `ng test`, mocha-via-script) fall back to `npm test --prefix <package>` — selection stays package-accurate, but those packages run their full suite.
+
+## Mixed-language monorepos
+
+A single run covers every ecosystem under `--root`. Each changed file is routed to the adapter owning its nearest build file (`.csproj`/`.sln`, `pom.xml`/`build.gradle`, `package.json`), so a fullstack repo — say a Maven backend with an Angular frontend — selects backend tests for `.java` changes and frontend specs for `.ts` changes in one invocation:
+
+```bash
+opentia --base HEAD~1 --root .   # all ecosystems, one combined result
+```
+
+The combined `test_command` chains each runner with `&&`. To restrict analysis to one ecosystem, pass `--lang dotnet|java|node`.
+
+Two more monorepo behaviours worth knowing:
+
+- **Changes outside `--root` are ignored** (reported in `strategy_notes`) rather than triggering a full run of the app you pointed at.
+- **Module-level build files** (a leaf `.csproj`, a module `pom.xml`, a workspace package's `package.json`) scope through the dependency graph like any other change to that project. Only workspace-level files (`.sln`, root/parent `pom.xml`, `settings.gradle`, root `package.json`, lockfile-style global config) force a full run.
+
 ---
 
 ## CI integration
 
-### Covering all commits in a PR (branch promotion)
-
-When merging a feature branch or promoting across environments (`dev → staging → main`), a PR may contain many commits. Use `--base` pointed at the **target branch** — opentia analyses the combined diff of every commit in the PR at once, so no change slips through.
-
-```bash
-# All changes between this branch and main, in one diff
-opentia --base origin/main --root . --output github-actions
-```
-
-In GitHub Actions, use the PR base SHA that GitHub provides:
+### GitHub Actions — pull request
 
 ```yaml
 on:
@@ -227,7 +135,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # required — shallow clones may not have the base commit
+          fetch-depth: 0
 
       - name: Test Impact Analysis
         id: tia
@@ -235,80 +143,32 @@ jobs:
 
       - name: Run affected tests
         if: steps.tia.outputs.has_tests == 'true'
-        run: ${{ steps.tia.outputs.dotnet_command }}
+        run: ${{ steps.tia.outputs.test_command }}
 ```
 
-> **Why `fetch-depth: 0`?** By default `actions/checkout` does a shallow clone. If the base commit is not present locally, `git diff` fails. `fetch-depth: 0` fetches the full history so the base SHA is always reachable.
+Available outputs: `test_filter`, `run_all`, `has_tests`, `test_project_paths`, `test_command`.
 
-### GitHub Actions (push to branch)
+### GitHub Actions — push to branch
 
 ```yaml
 - name: Test Impact Analysis
   id: tia
-  run: opentia --base ${{ github.event.before }} --root sample-app --output github-actions
+  run: opentia --base ${{ github.event.before }} --root . --output github-actions
 
 - name: Run affected tests
   if: steps.tia.outputs.has_tests == 'true'
-  run: ${{ steps.tia.outputs.dotnet_command }}
+  run: ${{ steps.tia.outputs.test_command }}
 ```
-
-Available outputs: `test_filter`, `run_all`, `has_tests`, `test_project_paths`, `dotnet_command`.
 
 ### Azure DevOps
 
 ```yaml
-- script: opentia --base $(System.PullRequest.TargetBranchName) --root sample-app --output azure-devops
+- script: opentia --base $(System.PullRequest.TargetBranchName) --root . --output azure-devops
   displayName: Test Impact Analysis
 
-- script: $(dotnetCommand)
+- script: $(testCommand)
   condition: eq(variables['hasTests'], 'true')
   displayName: Run affected tests
 ```
 
-Available variables: `testFilter`, `runAllTests`, `hasTests`, `testProjectPaths`, `dotnetCommand`.
-
----
-
-## How it works
-
-```
-git diff --name-status base..head
-    ↓
-classify each file → INFRA | IGNORED | CS_SOURCE | CONFIG | UNKNOWN
-    ↓
-INFRA  → run all tests
-IGNORED→ skip
-UNKNOWN→ run all tests (safe fallback)
-CS_SOURCE / CONFIG → run 3 strategies ↓
-
-discover_projects()      parse .sln + glob .csproj (excludes obj/ bin/)
-build_reverse_deps()     BFS: {source_project → set of test projects that cover it}
-    ↓ per CS_SOURCE file:
-  strategy 1: project dependency graph (ownership → reverse dep lookup)
-  strategy 2: convention mapping (FooService → FooServiceTests)
-  strategy 3: symbol search (public types → grep cached test files)
-    ↓ per CONFIG file:
-  find owning project → run its test projects (no class filter)
-    ↓
-build_filter()           FullyQualifiedName~A|FullyQualifiedName~B
-                         capped at 40 classes; drops to project-level if exceeded
-    ↓
-ImpactResult → formatter → stdout
-```
-
-**Fallback escalation** — rather than silently skipping tests, the script escalates:
-1. `.cs` file not owned by any known project → run all test projects
-2. Source project changed but dependency graph finds no covering tests → run all test projects
-3. Config file not owned by any project → run all test projects
-
----
-
-## Extending to other languages
-
-To add Python, Node.js, or Java support, provide:
-
-1. A `discover_projects()` equivalent that returns `List[Project]` for that ecosystem
-2. Three strategy functions matching the signatures of `strategy_dependency_graph`, `strategy_convention`, `strategy_symbol_search`
-3. New entries in `INFRA_EXTENSIONS`, `IGNORED_EXTENSIONS`, and `CONFIG_EXTENSIONS` for that ecosystem's file types
-
-The git analysis, file classification pipeline, output formatters, and CI integration are language-agnostic and require no changes.
+Available variables: `testFilter`, `runAllTests`, `hasTests`, `testProjectPaths`, `testCommand`.
