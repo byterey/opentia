@@ -251,6 +251,17 @@ try:
     result = tia(root=FS)
     check("Frontend .ts change → frontend specs only", result,
           expect_projects=["frontend"], exact=True)
+    # frontend uses karma/jasmine (no jest/vitest) → command must fall back
+    # to the package's own test script, not a jest invocation
+    cmd = result.get("test_command", "")
+    ok = cmd.startswith("npm test")
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] Karma project → 'npm test' command fallback")
+    if not ok:
+        print(f"         test_command: {cmd}")
 finally:
     restore(fs_ts, orig)
 

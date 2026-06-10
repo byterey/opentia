@@ -21,7 +21,7 @@ Usage:
 
 from __future__ import annotations
 
-__version__ = "1.0.4"
+__version__ = "1.1.0"
 
 import abc
 import argparse
@@ -1449,6 +1449,7 @@ class NodeAdapter(LanguageAdapter):
         return result
 
     def _detect_runner(self, result: ImpactResult) -> str:
+        has_test_script = False
         for pkg_path in result.test_project_paths + result.workspace_files:
             try:
                 data = json.loads(Path(pkg_path).read_text(encoding="utf-8", errors="replace"))
@@ -1460,9 +1461,14 @@ class NodeAdapter(LanguageAdapter):
                     return "vitest"
                 if "jest" in all_keys or "@jest/core" in all_keys:
                     return "jest"
+                if "test" in (data.get("scripts") or {}):
+                    has_test_script = True
             except (json.JSONDecodeError, OSError):
                 pass
-        return "jest"
+        # No known runner but a test script exists (karma, mocha via script,
+        # ng test, ...) — defer to the package's own script. Path filtering
+        # is not possible, so affected packages run their full suites.
+        return "npm" if has_test_script else "jest"
 
     def run_tests(
         self, result: ImpactResult, extra_args: List[str], cwd: Optional[Path],
@@ -1474,6 +1480,20 @@ class NodeAdapter(LanguageAdapter):
             else Path(result.test_project_paths[0]).parent if result.test_project_paths
             else cwd
         )
+        if runner == "npm":
+            if not result.test_project_paths:
+                cmd = ["npm", "test", *extra_args]
+                print(f"\n[RUN] {' '.join(cmd)}\n")
+                return subprocess.call(cmd, cwd=str(run_dir) if run_dir else None)
+            code = 0
+            for pkg in result.test_project_paths:
+                pkg_dir = Path(pkg).parent
+                cmd = ["npm", "test", *extra_args]
+                print(f"\n[RUN] {' '.join(cmd)}  (in {pkg_dir})\n")
+                rc = subprocess.call(cmd, cwd=str(pkg_dir))
+                if rc != 0:
+                    code = rc
+            return code
         if result.run_all:
             cmd = (
                 ["npx", "vitest", "run", *extra_args]
@@ -1494,8 +1514,10 @@ class NodeAdapter(LanguageAdapter):
                 else ["npx", "vitest", "run", *extra_args]
             )
         else:
+            # Positional pattern works on every jest major; --testPathPattern
+            # was renamed in Jest 30.
             cmd = (
-                ["npx", "jest", f"--testPathPattern={result.test_filter}", *extra_args]
+                ["npx", "jest", result.test_filter, *extra_args]
                 if result.test_filter
                 else ["npx", "jest", *extra_args]
             )
@@ -1504,14 +1526,19 @@ class NodeAdapter(LanguageAdapter):
 
     def fmt_command(self, result: ImpactResult) -> str:
         runner = self._detect_runner(result)
+        if runner == "npm":
+            if not result.test_project_paths:
+                return "npm test"
+            return " && ".join(
+                f'npm test --prefix "{Path(p).parent}"'
+                for p in result.test_project_paths
+            )
         base = f"npx {runner}" + (" run" if runner == "vitest" else "")
         if result.run_all:
             return base
         if not result.test_project_paths:
             return "(no tests to run)"
-        if runner == "vitest":
-            return f'{base} "{result.test_filter}"' if result.test_filter else base
-        return f'{base} --testPathPattern="{result.test_filter}"' if result.test_filter else base
+        return f'{base} "{result.test_filter}"' if result.test_filter else base
 
 
 # ---------------------------------------------------------------------------
