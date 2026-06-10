@@ -1632,6 +1632,20 @@ def assess(
         changes = get_changed_files("HEAD~1", head_ref, git_root)
         notes.append("No --base provided; defaulting to HEAD~1")
 
+    # ── 1b. Scope changes to --root ───────────────────────────────────────
+    scope = root.resolve()
+    if scope != git_root:
+        in_scope = [
+            c for c in changes
+            if any(_is_under(git_root / p, scope) for p in (c.path, c.old_path))
+        ]
+        skipped = [c.path for c in changes if c not in in_scope]
+        if skipped:
+            notes.append(
+                f"Ignored {len(skipped)} change(s) outside --root: {skipped}"
+            )
+        changes = in_scope
+
     def _finalize(result: ImpactResult) -> ImpactResult:
         result.test_command = adapter.fmt_command(result)
         return result
@@ -1670,14 +1684,36 @@ def assess(
     tp = _tp(projects)
     reverse_deps = build_reverse_deps(projects)
 
-    # ── 4. Infra changes → run everything ────────────────────────────────
+    # ── 4. Infra changes ──────────────────────────────────────────────────
+    # Workspace-level infra (.sln, root pom/package.json, settings.gradle,
+    # global config) → run everything. Module-level build files (a discovered
+    # project's own build file) → scope through the dependency graph like a
+    # config change owned by that project.
+    module_infra: List[FileChange] = []
     if infra:
-        notes.append(f"Infrastructure files changed: {[c.path for c in infra]}")
-        return _finalize(_make_run_all(
-            changes, projects, workspace_files,
-            f"Infrastructure file(s) changed — running all {len(tp)} test project(s)",
-            notes, adapter.language,
-        ))
+        ws_paths = {Path(w).resolve() for w in workspace_files}
+        proj_paths = {p.path for p in projects}
+        workspace_infra: List[FileChange] = []
+        for change in infra:
+            file_abs = (git_root / change.path).resolve()
+            if file_abs in proj_paths and file_abs not in ws_paths:
+                module_infra.append(change)
+            else:
+                workspace_infra.append(change)
+        if workspace_infra:
+            notes.append(
+                f"Infrastructure files changed: {[c.path for c in workspace_infra]}"
+            )
+            return _finalize(_make_run_all(
+                changes, projects, workspace_files,
+                f"Infrastructure file(s) changed — running all {len(tp)} test project(s)",
+                notes, adapter.language,
+            ))
+        notes.append(
+            "Module build file(s) changed — scoping to owning project(s): "
+            f"{[c.path for c in module_infra]}"
+        )
+        config = config + module_infra
 
     # ── 5. Unknown file types → safe fallback ────────────────────────────
     if unknown:
@@ -1835,6 +1871,16 @@ def assess(
             "projects found in the dependency graph. Running all test projects."
         )
         affected_test_paths = {p.path for p in tp}
+
+    # ── 10b. Module build-file change invalidates class-level narrowing ──
+    # A build file can affect every test in its module, so drop any class
+    # filter and run the affected test projects in full.
+    if module_infra and affected_classes:
+        notes.append(
+            "Module build file changed — dropping class-level filter, "
+            "running affected test projects in full."
+        )
+        affected_classes = set()
 
     # ── 11. Fill missing test classes for transitively-affected projects ─
     affected_classes = adapter.fill_missing_test_classes(

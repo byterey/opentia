@@ -34,7 +34,7 @@ def tia(extra_args=()):
         return {"_raw": r.stdout + r.stderr}
 
 
-def check(label, result, *, expect_projects=None, run_all=None, exact=False, no_tests=False):
+def check(label, result, *, expect_projects=None, run_all=None, exact=False, no_tests=False, expect_no_filter=False):
     global PASS, FAIL
     actual = set(result.get("affected_test_projects", []))
     ok = True
@@ -46,6 +46,9 @@ def check(label, result, *, expect_projects=None, run_all=None, exact=False, no_
     elif expect_projects is not None:
         expected = set(expect_projects)
         ok = (actual == expected) if exact else expected.issubset(actual)
+
+    if ok and expect_no_filter and result.get("test_filter"):
+        ok = False
 
     status = "PASS" if ok else "FAIL"
     if ok:
@@ -134,8 +137,44 @@ print("\n── Infrastructure (INFRA category) ──────────�
 csproj = APP / "src/MultiApp.Domain/MultiApp.Domain.csproj"
 orig = patch(csproj, "\n<!-- tia-test -->")
 result = tia()
-check(".csproj change → run_all", result, run_all=True)
+check(".csproj change (Domain, base layer) → run_all", result, run_all=True)
 restore(csproj, orig)
+
+# Module-level build file on a leaf project → scoped via dependency graph, not run-all
+csproj_leaf = APP / "src/MultiApp.Batch/MultiApp.Batch.csproj"
+orig = patch(csproj_leaf, "\n<!-- tia-test -->")
+result = tia()
+check("Leaf .csproj change → Batch.Tests only (module-scoped)", result,
+      expect_projects=["MultiApp.Batch.Tests"], exact=True)
+restore(csproj_leaf, orig)
+
+# Module build file + source file in same module → full module run, no class
+# narrowing (a build-file change can affect every test in the module)
+csproj_leaf = APP / "src/MultiApp.Batch/MultiApp.Batch.csproj"
+src_leaf = APP / "src/MultiApp.Batch/Jobs/OrderExpiryJob.cs"
+o1 = patch(csproj_leaf, "\n<!-- tia-test -->")
+o2 = patch(src_leaf)
+result = tia()
+check("Leaf .csproj + source change → Batch.Tests, no class filter", result,
+      expect_projects=["MultiApp.Batch.Tests"], exact=True, expect_no_filter=True)
+restore(csproj_leaf, o1)
+restore(src_leaf, o2)
+
+# Workspace-level build file → always run-all
+sln = APP / "MultiApp.sln"
+orig = patch(sln, "\n# tia-test")
+result = tia()
+check(".sln change → run_all", result, run_all=True)
+restore(sln, orig)
+
+print("\n── Root scoping ──────────────────────────────────────────────────────")
+
+# A change outside --root must not trigger this app's tests
+outside = REPO / "sample-app/src/SampleApp.Core/Utilities/StringHelper.cs"
+orig = patch(outside)
+result = tia()
+check("Change outside --root → no tests", result, no_tests=True)
+restore(outside, orig)
 
 print("\n── Test file changes ─────────────────────────────────────────────────")
 
