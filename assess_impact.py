@@ -258,6 +258,13 @@ def _excluded(path: Path) -> bool:
     return any(part in EXCLUDED_DIRS for part in path.parts)
 
 
+def _in_hidden_dir(path: str) -> bool:
+    """True when any directory segment is hidden (.claude, .github, .vscode,
+    …) — tooling config that never affects test execution paths."""
+    parts = path.replace("\\", "/").split("/")[:-1]
+    return any(p.startswith(".") for p in parts)
+
+
 def _iter_files(
     root: Path,
     *,
@@ -571,6 +578,8 @@ class DotNetAdapter(LanguageAdapter):
         p = change.path.lower()
         base = os.path.basename(p)
         ext = os.path.splitext(p)[1]
+        if _in_hidden_dir(p):
+            return ChangeCategory.IGNORED
         if ext in self._INFRA_EXTS or base in self._INFRA_NAMES:
             return ChangeCategory.INFRA
         if ext in IGNORED_EXTENSIONS or base in IGNORED_FILENAMES:
@@ -877,6 +886,8 @@ class JavaAdapter(LanguageAdapter):
         p = change.path.lower()
         base = os.path.basename(p)
         ext = os.path.splitext(p)[1]
+        if _in_hidden_dir(p):
+            return ChangeCategory.IGNORED
         if base in self._INFRA_NAMES:
             return ChangeCategory.INFRA
         if ext in IGNORED_EXTENSIONS or base in IGNORED_FILENAMES:
@@ -1370,6 +1381,8 @@ class NodeAdapter(LanguageAdapter):
         p = change.path.lower()
         base = os.path.basename(p)
         ext = os.path.splitext(p)[1]
+        if _in_hidden_dir(p):
+            return ChangeCategory.IGNORED
         if base in self._INFRA_NAMES:
             return ChangeCategory.INFRA
         if ext in IGNORED_EXTENSIONS or base in IGNORED_FILENAMES:

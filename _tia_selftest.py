@@ -419,6 +419,20 @@ finally:
     git_rm_cached(lp)
     lp.unlink(missing_ok=True)
 
+# Files under hidden tooling dirs (.claude, .github, .vscode) never affect tests
+hid = AND / ".github" / "workflows" / "ci.yml"
+hid.parent.mkdir(parents=True, exist_ok=True)
+hid.write_text("on: push\n", encoding="utf-8")
+git_add(hid)
+try:
+    result = tia(root=AND)
+    check("Hidden tooling dir change → no tests", result, no_tests=True)
+finally:
+    git_rm_cached(hid)
+    hid.unlink(missing_ok=True)
+    hid.parent.rmdir()
+    hid.parent.parent.rmdir()
+
 # Version catalog is workspace-level INFRA
 cat = AND / "gradle/libs.versions.toml"
 orig = patch(cat, "\n# tia-test\n")
