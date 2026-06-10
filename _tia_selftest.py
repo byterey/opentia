@@ -176,6 +176,32 @@ result = tia()
 check("Change outside --root → no tests", result, no_tests=True)
 restore(outside, orig)
 
+print("\n── Excluded-dir pruning ──────────────────────────────────────────────")
+
+# Generated .cs files under obj/ must not pollute the symbol-search cache
+polluted = APP / "tests/MultiApp.Domain.Tests/obj/PollutedTests.cs"
+polluted.parent.mkdir(parents=True, exist_ok=True)
+polluted.write_text(
+    "public class PollutedTests { /* OrderDomainService */ }", encoding="utf-8"
+)
+src = APP / "src/MultiApp.Domain/Services/OrderDomainService.cs"
+orig = patch(src)
+try:
+    result = tia()
+    ids = set(result.get("affected_test_classes", []))
+    ok = "PollutedTests" not in {i.split(".")[0] for i in ids}
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] obj/ .cs file excluded from symbol cache")
+    if not ok:
+        print(f"         identifiers: {sorted(ids)}")
+finally:
+    restore(src, orig)
+    polluted.unlink(missing_ok=True)
+    polluted.parent.rmdir()
+
 print("\n── Test file changes ─────────────────────────────────────────────────")
 
 scenario(

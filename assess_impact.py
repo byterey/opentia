@@ -37,7 +37,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, Iterator, List, Optional, Set, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +71,8 @@ EXCLUDED_DIRS: Tuple[str, ...] = (
 _NODE_EXCLUDED_DIRS: FrozenSet[str] = frozenset(
     EXCLUDED_DIRS
 ) - {"packages"}
+
+_EXCLUDED_SET: FrozenSet[str] = frozenset(EXCLUDED_DIRS)
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +252,24 @@ def _excluded(path: Path) -> bool:
     return any(part in EXCLUDED_DIRS for part in path.parts)
 
 
-def _node_excluded(path: Path) -> bool:
-    return any(part in _NODE_EXCLUDED_DIRS for part in path.parts)
+def _iter_files(
+    root: Path,
+    *,
+    filenames: Optional[FrozenSet[str]] = None,
+    suffixes: Optional[Tuple[str, ...]] = None,
+    excluded: FrozenSet[str] = _EXCLUDED_SET,
+) -> Iterator[Path]:
+    """Yield files under root matching lowercase filenames or suffixes,
+    pruning excluded directories during the walk (unlike rglob, which
+    descends into node_modules/obj/target before results can be filtered)."""
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in excluded]
+        for fname in files:
+            low = fname.lower()
+            if (filenames is not None and low in filenames) or (
+                suffixes is not None and low.endswith(suffixes)
+            ):
+                yield Path(dirpath) / fname
 
 
 def _find_owner(projects: List[Project], file_abs: Path) -> Optional[Project]:
@@ -493,7 +511,7 @@ class DotNetAdapter(LanguageAdapter):
     )
 
     def detect(self, root: Path) -> bool:
-        return bool(list(root.rglob("*.csproj"))[:1] or list(root.rglob("*.sln"))[:1])
+        return next(_iter_files(root, suffixes=(".csproj", ".sln")), None) is not None
 
     def classify(self, change: FileChange) -> ChangeCategory:
         p = change.path.lower()
@@ -513,9 +531,7 @@ class DotNetAdapter(LanguageAdapter):
         path_to_name: Dict[Path, str] = {}
         slns: List[Path] = []
 
-        for sln in root.rglob("*.sln"):
-            if _excluded(sln):
-                continue
+        for sln in sorted(_iter_files(root, suffixes=(".sln",))):
             slns.append(sln)
             try:
                 content = sln.read_text(encoding="utf-8-sig", errors="replace")
@@ -528,10 +544,9 @@ class DotNetAdapter(LanguageAdapter):
                 if abs_path.exists() and not _excluded(abs_path):
                     path_to_name.setdefault(abs_path, name)
 
-        for csproj in root.rglob("*.csproj"):
+        for csproj in sorted(_iter_files(root, suffixes=(".csproj",))):
             resolved = csproj.resolve()
-            if not _excluded(resolved):
-                path_to_name.setdefault(resolved, resolved.stem)
+            path_to_name.setdefault(resolved, resolved.stem)
 
         return [self._parse_csproj(name, path) for path, name in path_to_name.items()], slns
 
@@ -558,7 +573,7 @@ class DotNetAdapter(LanguageAdapter):
     def build_test_file_cache(self, test_projects: List[Project]) -> Dict[Path, str]:
         cache: Dict[Path, str] = {}
         for proj in test_projects:
-            for cs in proj.directory.rglob("*.cs"):
+            for cs in _iter_files(proj.directory, suffixes=(".cs",)):
                 if cs not in cache:
                     try:
                         cache[cs] = cs.read_text(encoding="utf-8", errors="replace")
@@ -584,13 +599,13 @@ class DotNetAdapter(LanguageAdapter):
                 f"{stem}Specs", f"{stem}Spec",
                 f"Test{stem}", f"Tests{stem}",
             ]
+            cand_by_fname = {f"{c}.cs".lower(): c for c in candidates}
             for proj in test_projects:
-                for cand in candidates:
-                    if list(proj.directory.rglob(f"{cand}.cs")):
-                        key = (proj.path, cand)
-                        if key not in seen:
-                            seen.add(key)
-                            results.append(key)
+                for hit in _iter_files(proj.directory, filenames=frozenset(cand_by_fname)):
+                    key = (proj.path, cand_by_fname[hit.name.lower()])
+                    if key not in seen:
+                        seen.add(key)
+                        results.append(key)
         return results
 
     def strategy_symbol_search(
@@ -742,12 +757,12 @@ class JavaAdapter(LanguageAdapter):
         ".properties", ".toml", ".ini",
     )
 
+    _BUILD_FILES: FrozenSet[str] = frozenset(
+        {"pom.xml", "build.gradle", "build.gradle.kts"}
+    )
+
     def detect(self, root: Path) -> bool:
-        return bool(
-            list(root.rglob("pom.xml"))[:1] or
-            list(root.rglob("build.gradle"))[:1] or
-            list(root.rglob("build.gradle.kts"))[:1]
-        )
+        return next(_iter_files(root, filenames=self._BUILD_FILES), None) is not None
 
     def classify(self, change: FileChange) -> ChangeCategory:
         p = change.path.lower()
@@ -845,9 +860,9 @@ class JavaAdapter(LanguageAdapter):
         projects: List[Project] = []
         workspace_files: List[Path] = []
 
-        for pom in sorted(root.rglob("pom.xml")):
+        for pom in sorted(_iter_files(root, filenames=frozenset({"pom.xml"}))):
             resolved = pom.resolve()
-            if _excluded(resolved) or resolved in seen:
+            if resolved in seen:
                 continue
             seen.add(resolved)
             projects.append(self._parse_pom(resolved))
@@ -856,13 +871,13 @@ class JavaAdapter(LanguageAdapter):
         if root_pom.exists():
             workspace_files.append(root_pom)
 
-        for gradle_name in ("build.gradle", "build.gradle.kts"):
-            for gradle in sorted(root.rglob(gradle_name)):
-                resolved = gradle.resolve()
-                if _excluded(resolved) or resolved in seen:
-                    continue
-                seen.add(resolved)
-                projects.append(self._parse_gradle(resolved))
+        gradle_names = frozenset({"build.gradle", "build.gradle.kts"})
+        for gradle in sorted(_iter_files(root, filenames=gradle_names)):
+            resolved = gradle.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            projects.append(self._parse_gradle(resolved))
 
         for sf in ("settings.gradle", "settings.gradle.kts"):
             sf_path = root / sf
@@ -877,13 +892,12 @@ class JavaAdapter(LanguageAdapter):
             for test_dir_rel in ("src/test/java", "src/test/kotlin", "src/test/groovy"):
                 test_dir = proj.directory / test_dir_rel.replace("/", os.sep)
                 if test_dir.exists():
-                    for ext in self._SOURCE_EXTS:
-                        for f in test_dir.rglob(f"*{ext}"):
-                            if f not in cache:
-                                try:
-                                    cache[f] = f.read_text(encoding="utf-8", errors="replace")
-                                except OSError:
-                                    pass
+                    for f in _iter_files(test_dir, suffixes=self._SOURCE_EXTS):
+                        if f not in cache:
+                            try:
+                                cache[f] = f.read_text(encoding="utf-8", errors="replace")
+                            except OSError:
+                                pass
         return cache
 
     def is_test_file(self, path: str) -> bool:
@@ -901,18 +915,19 @@ class JavaAdapter(LanguageAdapter):
                 continue
             stem = Path(p).stem
             candidates = [f"{stem}Test", f"{stem}Tests", f"{stem}IT", f"{stem}Spec"]
+            cand_by_stem = {c.lower(): c for c in candidates}
             for proj in test_projects:
                 for td_rel in ("src/test/java", "src/test/kotlin", "src/test/groovy"):
                     td = proj.directory / td_rel.replace("/", os.sep)
                     if not td.exists():
                         continue
-                    for cand in candidates:
-                        for ext in self._SOURCE_EXTS:
-                            if list(td.rglob(f"{cand}{ext}")):
-                                key = (proj.path, cand)
-                                if key not in seen:
-                                    seen.add(key)
-                                    results.append(key)
+                    for hit in _iter_files(td, suffixes=self._SOURCE_EXTS):
+                        cand = cand_by_stem.get(hit.stem.lower())
+                        if cand:
+                            key = (proj.path, cand)
+                            if key not in seen:
+                                seen.add(key)
+                                results.append(key)
         return results
 
     def strategy_symbol_search(
@@ -1140,9 +1155,11 @@ class NodeAdapter(LanguageAdapter):
             except (json.JSONDecodeError, OSError):
                 pass
 
-        for pkg in sorted(root.rglob("package.json")):
+        for pkg in sorted(_iter_files(
+            root, filenames=frozenset({"package.json"}), excluded=_NODE_EXCLUDED_DIRS,
+        )):
             resolved = pkg.resolve()
-            if _node_excluded(resolved) or resolved in seen:
+            if resolved in seen:
                 continue
             seen.add(resolved)
             projects.append(self._parse_package_json(resolved))
@@ -1157,9 +1174,11 @@ class NodeAdapter(LanguageAdapter):
                     # mark sub-package as test project if it owns test files
                     has_tests = any(
                         self.is_test_file(str(f))
-                        for ext in self._SOURCE_EXTS
-                        for f in proj.directory.rglob(f"*{ext}")
-                        if not _node_excluded(f)
+                        for f in _iter_files(
+                            proj.directory,
+                            suffixes=self._SOURCE_EXTS,
+                            excluded=_NODE_EXCLUDED_DIRS,
+                        )
                     )
                     if has_tests:
                         proj.is_test_project = True
@@ -1174,15 +1193,14 @@ class NodeAdapter(LanguageAdapter):
     def build_test_file_cache(self, test_projects: List[Project]) -> Dict[Path, str]:
         cache: Dict[Path, str] = {}
         for proj in test_projects:
-            for ext in self._SOURCE_EXTS:
-                for f in proj.directory.rglob(f"*{ext}"):
-                    if _node_excluded(f):
-                        continue
-                    if self.is_test_file(str(f)) and f not in cache:
-                        try:
-                            cache[f] = f.read_text(encoding="utf-8", errors="replace")
-                        except OSError:
-                            pass
+            for f in _iter_files(
+                proj.directory, suffixes=self._SOURCE_EXTS, excluded=_NODE_EXCLUDED_DIRS,
+            ):
+                if self.is_test_file(str(f)) and f not in cache:
+                    try:
+                        cache[f] = f.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        pass
         return cache
 
     def is_test_file(self, path: str) -> bool:
@@ -1202,27 +1220,28 @@ class NodeAdapter(LanguageAdapter):
             src = Path(p)
             stem = src.stem
             ext = src.suffix
+            direct_names = frozenset({
+                f"{stem}.test{ext}".lower(), f"{stem}.spec{ext}".lower(),
+                f"{stem}.test.ts", f"{stem}.spec.ts",
+                f"{stem}.test.js", f"{stem}.spec.js",
+            })
+            tests_dir_names = frozenset(f"{stem}{t}".lower() for t in self._SOURCE_EXTS)
             for proj in test_projects:
-                for pattern in (
-                    f"{stem}.test{ext}", f"{stem}.spec{ext}",
-                    f"{stem}.test.ts", f"{stem}.spec.ts",
-                    f"{stem}.test.js", f"{stem}.spec.js",
+                direct_hit: Optional[Path] = None
+                tests_hit: Optional[Path] = None
+                for f in _iter_files(
+                    proj.directory, suffixes=self._SOURCE_EXTS, excluded=_NODE_EXCLUDED_DIRS,
                 ):
-                    hits = list(proj.directory.rglob(pattern))
-                    if not hits:
-                        continue
-                    test_id = hits[0].stem
-                    key = (proj.path, test_id)
-                    if key not in seen:
-                        seen.add(key)
-                        results.append(key)
-                    break
-                # __tests__ directory
-                for t_ext in self._SOURCE_EXTS:
-                    hits = list(proj.directory.rglob(f"__tests__/{stem}{t_ext}"))
-                    if hits:
-                        test_id = hits[0].stem
-                        key = (proj.path, test_id)
+                    name = f.name.lower()
+                    if direct_hit is None and name in direct_names:
+                        direct_hit = f
+                    if tests_hit is None and f.parent.name == "__tests__" and name in tests_dir_names:
+                        tests_hit = f
+                    if direct_hit and tests_hit:
+                        break
+                for hit in (direct_hit, tests_hit):
+                    if hit:
+                        key = (proj.path, hit.stem)
                         if key not in seen:
                             seen.add(key)
                             results.append(key)
@@ -1303,10 +1322,11 @@ class NodeAdapter(LanguageAdapter):
             if proj is None:
                 continue
             proj_test_ids: Set[str] = set()
-            for ext in self._SOURCE_EXTS:
-                for f in proj.directory.rglob(f"*{ext}"):
-                    if not _node_excluded(f) and self.is_test_file(str(f)):
-                        proj_test_ids.add(f.stem)
+            for f in _iter_files(
+                proj.directory, suffixes=self._SOURCE_EXTS, excluded=_NODE_EXCLUDED_DIRS,
+            ):
+                if self.is_test_file(str(f)):
+                    proj_test_ids.add(f.stem)
             if proj_test_ids and not proj_test_ids.intersection(result):
                 result.update(proj_test_ids)
         return result
