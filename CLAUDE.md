@@ -225,6 +225,7 @@ When targeted selection fails, the script escalates rather than silently skippin
 | `collision-app/` | two C# apps, same-stem `Core.csproj` | path-based ProjectReference resolution |
 | `java-collision-app/` | two Maven apps, colliding `core` artifactIds | group:artifact qualified matching |
 | `android-app/` | Kotlin, nested Gradle modules (`:core:model`), unit + instrumented tests | Kotlin symbols/methods, androidTest routing, nested refs, per-module filters, version-catalog INFRA |
+| `gradle-nested/` | settings.gradle one level below `--root` | ref resolution anchored at the settings root, not `--root` |
 
 ## Extending to other languages
 
