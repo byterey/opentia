@@ -4,7 +4,7 @@ Analyses a git diff and selects only the tests whose execution path could have b
 
 **No external dependencies** — Python 3.8+ stdlib only.
 
-**Language support:** C# / .NET, Java (Maven / Gradle), and Node.js (Jest / Vitest / npm test scripts — single packages, npm/pnpm/lerna workspaces). Mixed-language repos are handled in a single run: changes are routed to the right ecosystem automatically.
+**Language support:** C# / .NET, Java (Maven / Gradle), Android (Kotlin, nested Gradle modules, instrumented tests), and Node.js (Jest / Vitest / npm test scripts — single packages, npm/pnpm/lerna workspaces). Mixed-language repos are handled in a single run: changes are routed to the right ecosystem automatically.
 
 ---
 
@@ -102,6 +102,15 @@ When changes span multiple ecosystems in one run, the same fields are emitted me
 opentia detects Jest and Vitest automatically. For **workspaces** (npm `workspaces`, `pnpm-workspace.yaml`, or `lerna.json`), each sub-package is analysed independently and the dependency graph is resolved across internal references — `workspace:*`, `file:`, **and plain version ranges** that match a sibling package name. Changing a shared package triggers tests in every package that depends on it.
 
 The test command is a single `npx jest` (or `npx vitest run`) invocation run from the workspace root with a test-path-pattern filter. Packages without jest/vitest but with a `test` script (karma, `ng test`, mocha-via-script) fall back to `npm test --prefix <package>` — selection stays package-accurate, but those packages run their full suite.
+
+## Android projects
+
+Android repos are handled by the Gradle adapter with Kotlin-aware analysis (Kotlin types and functions are public by default — no modifier needed for symbol matching). Per module:
+
+- Unit tests (`src/test`) run via `./gradlew :path:to:module:test --tests=...`; instrumented tests (`src/androidTest`) are selected separately and routed to `:path:to:module:connectedAndroidTest` (device/emulator required).
+- Nested module references (`project(":core:model")`) resolve by path, and each module's command carries only its own test classes — a `--tests` pattern matching nothing would fail the task.
+- `gradle/libs.versions.toml` is workspace-level INFRA (full run); `local.properties`, keystores (`.jks`/`.keystore`), `build/` output, and hidden tooling dirs (`.github/`, `.claude/`, …) are ignored; `proguard-rules.pro` scopes to its owning module.
+- Method-level narrowing only applies when every changed method in a test class is `@Test`-annotated; a changed helper widens to the whole class.
 
 ## Mixed-language monorepos
 

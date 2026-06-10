@@ -86,7 +86,7 @@ Never: delete a failing test, change an assertion to match broken output, mark a
 
 A **multi-language Test Impact Analysis (TIA)** tool, published to PyPI as `opentia`. Given a git diff, `assess_impact.py` selects only the tests whose execution path could have been affected by the change — avoiding a full suite run on every push.
 
-Supported ecosystems via `LanguageAdapter` subclasses: **C# / .NET** (`.sln`/`.csproj`), **Java** (Maven + Gradle), **Node.js** (Jest / Vitest / npm test scripts; npm, pnpm, and lerna workspaces). Polyglot repos are handled in one run — changes are partitioned to the adapter owning their nearest build-file ancestor.
+Supported ecosystems via `LanguageAdapter` subclasses: **C# / .NET** (`.sln`/`.csproj`), **Java / Android** (Maven + Gradle; Kotlin-aware, nested Gradle modules, `src/androidTest` → `connectedAndroidTest`), **Node.js** (Jest / Vitest / npm test scripts; npm, pnpm, and lerna workspaces). Polyglot repos are handled in one run — changes are partitioned to the adapter owning their nearest build-file ancestor.
 
 The repo contains tracked validation apps (see *Validation apps* below) and a scenario harness, `_tia_selftest.py`.
 
@@ -187,7 +187,7 @@ ImpactResult per adapter → formatter → stdout
 | `CONFIG` | `.json`, `.xml`, `.yaml`, `.resx`, `.razor`, `.properties`, etc. | Find owning project, run its tests + dependents |
 | `UNKNOWN` | Anything else | Run all tests (safe fallback) |
 
-Workspace-level = `.sln`, root/parent `pom.xml`, `settings.gradle`, root `package.json`, `pnpm-workspace.yaml`, `global.json`, `Directory.Build.*`. Module-level = a discovered project's own build file.
+Workspace-level = `.sln`, root/parent `pom.xml`, `settings.gradle`, root `package.json`, `pnpm-workspace.yaml`, `libs.versions.toml`, `global.json`, `Directory.Build.*`. Module-level = a discovered project's own build file. Files under hidden tooling dirs (`.github/`, `.claude/`, `.vscode/`, …) and `local.properties` are always IGNORED.
 
 ### Safe fallback chain
 
@@ -207,7 +207,7 @@ When targeted selection fails, the script escalates rather than silently skippin
 ### Test project detection
 
 - **.NET:** `<IsTestProject>true</IsTestProject>` → known test NuGet package (`xunit`, `nunit`, `moq`, …) → name ends `.Tests`/`.Test`/`.Specs`/`.Spec`.
-- **Java:** `src/test/java|kotlin` exists, or a test-scoped / known test dependency (`junit`, `mockito`, …). Mixed modules (source + tests in one module) are normal; `is_test_file()` (`src/test/` in path) distinguishes within the module.
+- **Java / Android:** `src/test/java|kotlin` or `src/androidTest/java|kotlin` exists, or a test-scoped / known test dependency (`junit`, `mockito`, `robolectric`, `mockk`, `espresso-core`, …). Mixed modules (source + tests in one module) are normal; `is_test_file()` (`src/test/` or `src/androidTest/` in path) distinguishes within the module. Gradle class filters are scoped per module; instrumented classes route to `connectedAndroidTest`.
 - **Node:** jest/vitest/jasmine in deps or a `test` script; in workspaces, sub-packages owning `.test.`/`.spec.`/`__tests__` files. The workspace root itself is the runner, never a test project.
 
 ## Validation apps
@@ -224,6 +224,7 @@ When targeted selection fails, the script escalates rather than silently skippin
 | `node-plain-mono/` | pnpm-style (plain-version internal deps, hoisted jest) | pnpm/lerna detection, name-matched dep edges |
 | `collision-app/` | two C# apps, same-stem `Core.csproj` | path-based ProjectReference resolution |
 | `java-collision-app/` | two Maven apps, colliding `core` artifactIds | group:artifact qualified matching |
+| `android-app/` | Kotlin, nested Gradle modules (`:core:model`), unit + instrumented tests | Kotlin symbols/methods, androidTest routing, nested refs, per-module filters, version-catalog INFRA |
 
 ## Extending to other languages
 

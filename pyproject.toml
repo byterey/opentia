@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opentia"
-version = "1.1.0"
-description = "Test Impact Analysis for C# / .NET, Java, and Node.js — selects only tests affected by a git diff. Polyglot and monorepo aware."
+version = "1.2.0"
+description = "Test Impact Analysis for C# / .NET, Java, Android (Kotlin), and Node.js — selects only tests affected by a git diff. Polyglot and monorepo aware."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
