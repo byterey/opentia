@@ -1,0 +1,8 @@
+{
+  "name": "@plain/services",
+  "version": "1.0.0",
+  "main": "src/checkout.ts",
+  "dependencies": {
+    "@plain/core": "^1.0.0"
+  }
+}
