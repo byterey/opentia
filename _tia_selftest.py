@@ -126,6 +126,27 @@ scenario(
     APP / "src/MultiApp.Infrastructure/Repositories/InMemoryOrderRepository.cs",
     expect_projects=INFRA_BATCH,
 )
+
+# Per-project filters (.NET): a project selected via the dependency graph
+# whose classes are all foreign must run unfiltered — a --filter matching
+# nothing skips its tests entirely
+orig = patch(APP / "src/MultiApp.Infrastructure/Repositories/InMemoryOrderRepository.cs")
+try:
+    result = tia()
+    segs = result.get("test_command", "").split(" && ")
+    # Batch.Tests is selected transitively; Infrastructure's classes must not
+    # appear in its filter
+    batch_seg = next((s for s in segs if "MultiApp.Batch.Tests" in s), "")
+    ok = bool(batch_seg) and "InMemoryOrderRepositoryTests" not in batch_seg
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] .NET filters scoped per project (Batch segment clean)")
+    if not ok:
+        print(f"         batch segment: {batch_seg}")
+finally:
+    restore(APP / "src/MultiApp.Infrastructure/Repositories/InMemoryOrderRepository.cs", orig)
 scenario(
     "Batch job change      → Batch.Tests only",
     APP / "src/MultiApp.Batch/Jobs/OrderExpiryJob.cs",
@@ -317,8 +338,41 @@ try:
     if not ok:
         print(f"         actual_projects   : {sorted(actual)}")
         print(f"         appb excluded     : {paths_ok}")
+    # Maven -pl selects by artifactId, not directory name
+    cmd = result.get("test_command", "")
+    ok = '-pl ":appa-services"' in cmd
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] Maven -pl uses artifactId (appa-services, not dir name)")
+    if not ok:
+        print(f"         test_command: {cmd}")
 finally:
     restore(jca_src, orig)
+
+print("\n── Nested Gradle workspace (settings root below --root) ──────────────")
+
+# Gradle module refs are relative to settings.gradle, which may not be at
+# --root; dropped edges mean dependents' tests silently skip
+GN = REPO / "gradle-nested"
+gn_src = GN / "workspace/libs/liba/src/main/java/com/example/liba/Greeter.kt"
+orig = patch(gn_src)
+try:
+    result = tia(root=GN)
+    check("liba change → liba + libb (refs resolved from settings root)", result,
+          expect_projects=["liba", "libb"], exact=True)
+    cmd = result.get("test_command", "")
+    ok = ":libs:liba:test" in cmd
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] Task path relative to nested settings root")
+    if not ok:
+        print(f"         test_command: {cmd}")
+finally:
+    restore(gn_src, orig)
 
 print("\n── Android (Kotlin, nested Gradle modules) ───────────────────────────")
 

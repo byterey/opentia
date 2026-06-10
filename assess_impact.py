@@ -736,13 +736,29 @@ class DotNetAdapter(LanguageAdapter):
             return "", True
         return "|".join(f"FullyQualifiedName~{c}" for c in sorted(test_ids)), False
 
+    def _project_classes(self, proj_path: str, classes: Set[str]) -> Set[str]:
+        """Scope class filters to this project — the global filter set spans
+        every affected project, and a --filter matching nothing skips the
+        project's tests. Empty result → callers run the project unfiltered."""
+        stems = {
+            f.stem for f in _iter_files(Path(proj_path).parent, suffixes=(".cs",))
+        }
+        return {c for c in classes if c.split(".")[0] in stems}
+
+    def _project_filter(self, proj_path: str, result: ImpactResult) -> str:
+        if not result.test_filter:
+            return ""
+        scoped = self._project_classes(proj_path, result.affected_test_classes)
+        if not scoped:
+            return ""
+        return "|".join(f"FullyQualifiedName~{c}" for c in sorted(scoped))
+
     def extract_test_identifiers(self, file_path: Path, content: str) -> List[str]:
         return _DOTNET_TEST_CLASS_RE.findall(content)
 
     def run_tests(
         self, result: ImpactResult, extra_args: List[str], cwd: Optional[Path],
     ) -> int:
-        filter_args = ["--filter", result.test_filter] if result.test_filter else []
         if result.run_all and not result.test_filter:
             if result.workspace_files:
                 code = 0
@@ -763,6 +779,8 @@ class DotNetAdapter(LanguageAdapter):
 
         code = 0
         for proj in result.test_project_paths:
+            proj_filter = self._project_filter(proj, result)
+            filter_args = ["--filter", proj_filter] if proj_filter else []
             cmd = ["dotnet", "test", proj, *extra_args, *filter_args]
             print(f"\n[RUN] {' '.join(cmd)}\n")
             rc = subprocess.call(cmd, cwd=str(cwd) if cwd else None)
@@ -771,16 +789,18 @@ class DotNetAdapter(LanguageAdapter):
         return code
 
     def fmt_command(self, result: ImpactResult) -> str:
-        filter_part = f' --filter "{result.test_filter}"' if result.test_filter else ""
         if result.run_all and not result.test_filter:
             if result.workspace_files:
                 return " && ".join(f'dotnet test "{s}"' for s in result.workspace_files)
             return "dotnet test"
         if not result.test_project_paths:
             return "(no tests to run)"
-        return " && ".join(
-            f'dotnet test "{p}"{filter_part}' for p in result.test_project_paths
-        )
+        parts = []
+        for p in result.test_project_paths:
+            proj_filter = self._project_filter(p, result)
+            filter_part = f' --filter "{proj_filter}"' if proj_filter else ""
+            parts.append(f'dotnet test "{p}"{filter_part}')
+        return " && ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -824,7 +844,8 @@ _JAVA_METHOD_RE = re.compile(
     r'(?:'
     r'(?:(?:public|internal|private|protected|open|override|suspend|inline|'
     r'operator|infix|tailrec|actual|expect)\s+)*'
-    r'fun\s+(?:<[^>]*>\s+)?(?P<kt>\w+)\s*\('
+    # optional generics, then optional extension receiver(s): fun String.toSlug(
+    r'fun\s+(?:<[^>]*>\s+)?(?:\w+(?:<[^>]*>)?\??\.)*(?P<kt>\w+)\s*\('
     r'|'
     r'(?:(?:public|protected|private|static|final|abstract|synchronized|'
     r'native|default|strictfp)\s+)+'
@@ -1033,13 +1054,15 @@ class JavaAdapter(LanguageAdapter):
             gradle_projects.append(proj)
 
         # Resolve project(":a:b") refs to build-file paths relative to the
-        # gradle root. Name matching can't see nested module paths (the
-        # project name is just the directory name); unresolved refs keep
-        # their name for fallback matching.
+        # gradle root — the settings.gradle location nearest the referring
+        # module, which is not necessarily --root. Name matching can't see
+        # nested module paths (the project name is just the directory name);
+        # unresolved refs keep their name for fallback matching.
         for proj in gradle_projects:
+            base = self._gradle_root(proj.directory) or root
             remaining: List[str] = []
             for ref in proj.project_references:
-                cand_dir = root.joinpath(*ref.split("/"))
+                cand_dir = base.joinpath(*ref.split("/"))
                 for bf_name in ("build.gradle", "build.gradle.kts"):
                     cand = cand_dir / bf_name
                     if cand.exists():
@@ -1174,18 +1197,28 @@ class JavaAdapter(LanguageAdapter):
         d = Path(proj_path).parent
         return (d / "build.gradle").exists() or (d / "build.gradle.kts").exists()
 
+    @staticmethod
+    def _gradle_root(start: Path) -> Optional[Path]:
+        """Nearest ancestor of start (inclusive) containing settings.gradle.
+        Bounded by the repository: never walks above a directory containing
+        .git — a stray settings file outside the repo must not win."""
+        cur = start
+        while True:
+            if (cur / "settings.gradle").exists() or (cur / "settings.gradle.kts").exists():
+                return cur
+            if (cur / ".git").exists() or cur.parent == cur:
+                return None
+            cur = cur.parent
+
     def _gradle_module_path(self, proj_path: str) -> str:
         """Gradle path of the module (e.g. 'core:model') — the directory path
         relative to the settings.gradle root, colon-joined. Empty string for
         the root module; module dir name when no settings file is found."""
         d = Path(proj_path).parent
-        cur = d
-        while True:
-            if (cur / "settings.gradle").exists() or (cur / "settings.gradle.kts").exists():
-                return ":".join(d.relative_to(cur).parts)
-            if cur.parent == cur:
-                return d.name
-            cur = cur.parent
+        groot = self._gradle_root(d)
+        if groot is None:
+            return d.name
+        return ":".join(d.relative_to(groot).parts)
 
     def _module_classes(
         self, proj_path: str, classes: Set[str],
@@ -1234,9 +1267,12 @@ class JavaAdapter(LanguageAdapter):
             print("[INFO] No tests to run.", file=sys.stderr)
             return 0
 
+        # Project names run parallel to paths in ImpactResult; Maven's -pl
+        # selector needs the artifactId (the name), not the directory name.
+        name_by_path = dict(zip(result.test_project_paths, result.affected_test_projects))
         code = 0
         for proj_path in result.test_project_paths:
-            module_name = Path(proj_path).parent.name
+            module_name = name_by_path.get(proj_path, Path(proj_path).parent.name)
             is_gradle = self._is_gradle_project(proj_path)
             cmds: List[List[str]] = []
             if is_gradle:
@@ -1287,8 +1323,9 @@ class JavaAdapter(LanguageAdapter):
         if not result.test_project_paths:
             return "(no tests to run)"
         parts = []
+        name_by_path = dict(zip(result.test_project_paths, result.affected_test_projects))
         for proj_path in result.test_project_paths:
-            module_name = Path(proj_path).parent.name
+            module_name = name_by_path.get(proj_path, Path(proj_path).parent.name)
             gradle = self._is_gradle_project(proj_path)
             if gradle:
                 mp = self._gradle_module_path(proj_path)
@@ -1914,6 +1951,19 @@ def _find_method_owners(
     return result
 
 
+# Annotation / attribute names that mark a runnable test method. Exact names
+# only — substring matching would treat @TestOnly helpers as tests and emit
+# filters that run nothing.
+_TEST_ANNOTATIONS: FrozenSet[str] = frozenset({
+    "test", "parameterizedtest", "repeatedtest", "testfactory", "testtemplate",  # JUnit
+    "fact", "theory",                                                            # xUnit
+    "testmethod", "datatestmethod",                                              # MSTest
+    "testcase",                                                                  # NUnit
+})
+
+_ANNOTATION_NAME_RE = re.compile(r'[@\[]\s*(?:\w+\.)*(\w+)')
+
+
 def _is_test_annotated(lines: List[str], decl_lineno: int) -> bool:
     """True if the method declared at decl_lineno (1-based) is preceded by a
     test annotation/attribute (@Test, [Fact], [Theory], @ParameterizedTest, …)."""
@@ -1924,9 +1974,9 @@ def _is_test_annotated(lines: List[str], decl_lineno: int) -> bool:
             i -= 1
             continue
         if s.startswith(("@", "[")):
-            low = s.lower()
-            if "test" in low or "fact" in low or "theory" in low:
-                return True
+            for name in _ANNOTATION_NAME_RE.findall(s):
+                if name.lower() in _TEST_ANNOTATIONS:
+                    return True
             i -= 1
             continue
         return False
