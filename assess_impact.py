@@ -366,6 +366,12 @@ class LanguageAdapter(abc.ABC):
         """Return True if this adapter handles the project at root."""
 
     @abc.abstractmethod
+    def has_build_file(self, directory: Path) -> bool:
+        """True if directory directly contains this ecosystem's build file.
+        Used to route changed files to adapters in polyglot repos: the nearest
+        ancestor directory with a build file owns the file."""
+
+    @abc.abstractmethod
     def classify(self, change: FileChange) -> ChangeCategory:
         """Classify a single file change."""
 
@@ -512,6 +518,15 @@ class DotNetAdapter(LanguageAdapter):
 
     def detect(self, root: Path) -> bool:
         return next(_iter_files(root, suffixes=(".csproj", ".sln")), None) is not None
+
+    def has_build_file(self, directory: Path) -> bool:
+        try:
+            return any(
+                f.suffix.lower() in (".csproj", ".sln")
+                for f in directory.iterdir() if f.is_file()
+            )
+        except OSError:
+            return False
 
     def classify(self, change: FileChange) -> ChangeCategory:
         p = change.path.lower()
@@ -763,6 +778,13 @@ class JavaAdapter(LanguageAdapter):
 
     def detect(self, root: Path) -> bool:
         return next(_iter_files(root, filenames=self._BUILD_FILES), None) is not None
+
+    def has_build_file(self, directory: Path) -> bool:
+        return any(
+            (directory / name).is_file()
+            for name in ("pom.xml", "build.gradle", "build.gradle.kts",
+                         "settings.gradle", "settings.gradle.kts")
+        )
 
     def classify(self, change: FileChange) -> ChangeCategory:
         p = change.path.lower()
@@ -1104,7 +1126,14 @@ class NodeAdapter(LanguageAdapter):
     _CONFIG_EXTS: Tuple[str, ...] = (".json", ".yaml", ".yml", ".env", ".toml")
 
     def detect(self, root: Path) -> bool:
-        return (root / "package.json").exists()
+        # Nested search: in polyglot repos the package.json may live in a
+        # sub-app (e.g. a frontend/ folder next to a Maven backend).
+        return next(_iter_files(
+            root, filenames=frozenset({"package.json"}), excluded=_NODE_EXCLUDED_DIRS,
+        ), None) is not None
+
+    def has_build_file(self, directory: Path) -> bool:
+        return (directory / "package.json").is_file()
 
     def classify(self, change: FileChange) -> ChangeCategory:
         p = change.path.lower()
@@ -1404,17 +1433,50 @@ class NodeAdapter(LanguageAdapter):
 _ADAPTERS: List[LanguageAdapter] = [DotNetAdapter(), JavaAdapter(), NodeAdapter()]
 
 
-def detect_adapter(root: Path, lang_hint: Optional[str] = None) -> LanguageAdapter:
+def detect_adapters(root: Path, lang_hint: Optional[str] = None) -> List[LanguageAdapter]:
+    """Return all adapters whose ecosystem is present at root (priority order).
+    A --lang hint forces a single adapter."""
     if lang_hint:
         mapping = {"dotnet": DotNetAdapter, "java": JavaAdapter, "node": NodeAdapter}
         cls = mapping.get(lang_hint.lower())
         if cls:
-            return cls()
+            return [cls()]
         print(f"[WARN] Unknown --lang '{lang_hint}', auto-detecting.", file=sys.stderr)
-    for adapter in _ADAPTERS:
-        if adapter.detect(root):
-            return adapter
-    return DotNetAdapter()  # safe fallback
+    found = [adapter for adapter in _ADAPTERS if adapter.detect(root)]
+    return found or [DotNetAdapter()]  # safe fallback
+
+
+def detect_adapter(root: Path, lang_hint: Optional[str] = None) -> LanguageAdapter:
+    return detect_adapters(root, lang_hint)[0]
+
+
+def partition_changes(
+    changes: List[FileChange],
+    adapters: List[LanguageAdapter],
+    git_root: Path,
+    scope_root: Path,
+) -> Dict[str, List[FileChange]]:
+    """Route each change to the adapter owning its nearest build-file ancestor.
+    Changes with no owning build file go to every adapter (safe fallback —
+    each adapter's own UNKNOWN/unmatched escalation then applies)."""
+    slices: Dict[str, List[FileChange]] = {a.language: [] for a in adapters}
+    for change in changes:
+        owner_lang: Optional[str] = None
+        d = (git_root / change.path).parent
+        while _is_under(d, scope_root):
+            for adapter in adapters:
+                if adapter.has_build_file(d):
+                    owner_lang = adapter.language
+                    break
+            if owner_lang is not None or d == scope_root:
+                break
+            d = d.parent
+        if owner_lang is not None:
+            slices[owner_lang].append(change)
+        else:
+            for adapter in adapters:
+                slices[adapter.language].append(change)
+    return slices
 
 
 # ---------------------------------------------------------------------------
@@ -1623,6 +1685,26 @@ def _find_test_methods_in_cache(
     return found
 
 
+def _collect_changes(
+    base_ref: Optional[str],
+    head_ref: str,
+    git_root: Path,
+    use_working_tree: bool,
+    staged_only: bool,
+    notes: List[str],
+) -> List[FileChange]:
+    if staged_only:
+        notes.append("Comparing staged changes only")
+        return get_changed_files_working_tree(git_root, staged_only=True)
+    if use_working_tree:
+        notes.append("Comparing against working tree (staged + unstaged)")
+        return get_changed_files_working_tree(git_root)
+    if base_ref:
+        return get_changed_files(base_ref, head_ref, git_root)
+    notes.append("No --base provided; defaulting to HEAD~1")
+    return get_changed_files("HEAD~1", head_ref, git_root)
+
+
 def assess(
     root: Path,
     git_root: Path,
@@ -1632,6 +1714,7 @@ def assess(
     use_working_tree: bool = False,
     staged_only: bool = False,
     adapter: Optional[LanguageAdapter] = None,
+    changes: Optional[List[FileChange]] = None,
 ) -> ImpactResult:
     """Run the full test impact assessment."""
     if adapter is None:
@@ -1639,18 +1722,11 @@ def assess(
 
     notes: List[str] = [f"Language adapter: {adapter.language}"]
 
-    # ── 1. Collect changes ────────────────────────────────────────────────
-    if staged_only:
-        changes = get_changed_files_working_tree(git_root, staged_only=True)
-        notes.append("Comparing staged changes only")
-    elif use_working_tree:
-        changes = get_changed_files_working_tree(git_root)
-        notes.append("Comparing against working tree (staged + unstaged)")
-    elif base_ref:
-        changes = get_changed_files(base_ref, head_ref, git_root)
-    else:
-        changes = get_changed_files("HEAD~1", head_ref, git_root)
-        notes.append("No --base provided; defaulting to HEAD~1")
+    # ── 1. Collect changes (unless injected by assess_all) ───────────────
+    if changes is None:
+        changes = _collect_changes(
+            base_ref, head_ref, git_root, use_working_tree, staged_only, notes
+        )
 
     # ── 1b. Scope changes to --root ───────────────────────────────────────
     scope = root.resolve()
@@ -1948,10 +2024,92 @@ def assess(
 
 
 # ---------------------------------------------------------------------------
+# Multi-adapter orchestration
+# ---------------------------------------------------------------------------
+
+def assess_all(
+    root: Path,
+    git_root: Path,
+    base_ref: Optional[str],
+    head_ref: str = "HEAD",
+    strategy: str = "hybrid",
+    use_working_tree: bool = False,
+    staged_only: bool = False,
+    adapters: Optional[List[LanguageAdapter]] = None,
+) -> List[Tuple[LanguageAdapter, ImpactResult]]:
+    """Assess once per detected ecosystem. In polyglot repos, changes are
+    partitioned by nearest build-file ancestor and each adapter analyses
+    only its own slice."""
+    if adapters is None:
+        adapters = detect_adapters(root)
+    if len(adapters) == 1:
+        return [(adapters[0], assess(
+            root, git_root, base_ref, head_ref, strategy,
+            use_working_tree, staged_only, adapters[0],
+        ))]
+
+    collect_notes: List[str] = []
+    changes = _collect_changes(
+        base_ref, head_ref, git_root, use_working_tree, staged_only, collect_notes
+    )
+    slices = partition_changes(changes, adapters, git_root, root.resolve())
+    pairs: List[Tuple[LanguageAdapter, ImpactResult]] = []
+    for adapter in adapters:
+        adapter_changes = slices.get(adapter.language, [])
+        if not adapter_changes:
+            continue
+        pairs.append((adapter, assess(
+            root, git_root, base_ref, head_ref, strategy,
+            use_working_tree, staged_only, adapter, changes=adapter_changes,
+        )))
+    if not pairs:
+        pairs = [(adapters[0], assess(
+            root, git_root, base_ref, head_ref, strategy,
+            use_working_tree, staged_only, adapters[0], changes=[],
+        ))]
+    return pairs
+
+
+def _merge_results(results: List[ImpactResult]) -> ImpactResult:
+    """Collapse per-language results into one summary result (used by the
+    CI formatters, whose output is a flat variable set)."""
+    if len(results) == 1:
+        return results[0]
+    filters = [r.test_filter for r in results if r.test_filter]
+    commands = [
+        r.test_command for r in results
+        if r.test_command and r.test_command != "(no tests to run)"
+    ]
+    seen_changes: Set[Tuple[str, str]] = set()
+    changes: List[FileChange] = []
+    for r in results:
+        for c in r.changes:
+            key = (c.path, c.status.value)
+            if key not in seen_changes:
+                seen_changes.add(key)
+                changes.append(c)
+    return ImpactResult(
+        changes=changes,
+        affected_source_projects=[x for r in results for x in r.affected_source_projects],
+        affected_test_projects=[x for r in results for x in r.affected_test_projects],
+        affected_test_classes=set().union(*[r.affected_test_classes for r in results]),
+        # A single combined filter string is only meaningful for one runner
+        test_filter=filters[0] if len(filters) == 1 else "",
+        test_project_paths=[x for r in results for x in r.test_project_paths],
+        workspace_files=[x for r in results for x in r.workspace_files],
+        run_all=any(r.run_all for r in results),
+        reason="; ".join(r.reason for r in results),
+        language=",".join(r.language for r in results),
+        test_command=" && ".join(commands) or "(no tests to run)",
+        strategy_notes=[x for r in results for x in r.strategy_notes],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Output formatters
 # ---------------------------------------------------------------------------
 
-def fmt_human(result: ImpactResult) -> str:
+def _fmt_human_one(result: ImpactResult) -> str:
     sep = "─" * 66
 
     def section(title: str, items) -> List[str]:
@@ -2003,30 +2161,40 @@ def fmt_human(result: ImpactResult) -> str:
     return "\n".join(lines)
 
 
-def fmt_json(result: ImpactResult) -> str:
-    return json.dumps(
-        {
-            "language": result.language,
-            "reason": result.reason,
-            "run_all": result.run_all,
-            "changes": [
-                {"path": c.path, "old_path": c.old_path, "status": c.status.value}
-                for c in result.changes
-            ],
-            "affected_source_projects": result.affected_source_projects,
-            "affected_test_projects": result.affected_test_projects,
-            "affected_test_classes": sorted(result.affected_test_classes),
-            "test_filter": result.test_filter,
-            "test_project_paths": result.test_project_paths,
-            "workspace_files": result.workspace_files,
-            "test_command": result.test_command,
-            "strategy_notes": result.strategy_notes,
-        },
-        indent=2,
-    )
+def fmt_human(results: List[ImpactResult]) -> str:
+    return "\n".join(_fmt_human_one(r) for r in results)
 
 
-def fmt_github_actions(result: ImpactResult) -> str:
+def _result_dict(result: ImpactResult) -> Dict:
+    return {
+        "language": result.language,
+        "reason": result.reason,
+        "run_all": result.run_all,
+        "changes": [
+            {"path": c.path, "old_path": c.old_path, "status": c.status.value}
+            for c in result.changes
+        ],
+        "affected_source_projects": result.affected_source_projects,
+        "affected_test_projects": result.affected_test_projects,
+        "affected_test_classes": sorted(result.affected_test_classes),
+        "test_filter": result.test_filter,
+        "test_project_paths": result.test_project_paths,
+        "workspace_files": result.workspace_files,
+        "test_command": result.test_command,
+        "strategy_notes": result.strategy_notes,
+    }
+
+
+def fmt_json(results: List[ImpactResult]) -> str:
+    if len(results) == 1:
+        return json.dumps(_result_dict(results[0]), indent=2)
+    merged = _result_dict(_merge_results(results))
+    merged["results"] = [_result_dict(r) for r in results]
+    return json.dumps(merged, indent=2)
+
+
+def fmt_github_actions(results: List[ImpactResult]) -> str:
+    result = _merge_results(results)
     simple = {
         "language": result.language,
         "test_filter": result.test_filter,
@@ -2050,7 +2218,8 @@ def _ado_escape(v: str) -> str:
     return v.replace("%", "%AZP25").replace("]", "%5D").replace("\r", "").replace("\n", "")
 
 
-def fmt_azure_devops(result: ImpactResult) -> str:
+def fmt_azure_devops(results: List[ImpactResult]) -> str:
+    result = _merge_results(results)
     vars_ = {
         "language": result.language,
         "testFilter": result.test_filter,
@@ -2171,9 +2340,9 @@ def main() -> None:
         sys.exit(1)
 
     git_root = get_git_root(root)
-    adapter = detect_adapter(root, lang_hint=args.lang)
+    adapters = detect_adapters(root, lang_hint=args.lang)
 
-    result = assess(
+    pairs = assess_all(
         root=root,
         git_root=git_root,
         base_ref=args.base,
@@ -2181,8 +2350,9 @@ def main() -> None:
         strategy=args.strategy,
         use_working_tree=args.unstaged,
         staged_only=args.staged,
-        adapter=adapter,
+        adapters=adapters,
     )
+    results = [result for _, result in pairs]
 
     formatters = {
         "human": fmt_human,
@@ -2190,11 +2360,16 @@ def main() -> None:
         "github-actions": fmt_github_actions,
         "azure-devops": fmt_azure_devops,
     }
-    print(formatters[args.output](result))
+    print(formatters[args.output](results))
 
     if args.run:
         extra = [a for a in args.extra_args if a != "--"]
-        sys.exit(adapter.run_tests(result, extra, cwd=root))
+        code = 0
+        for adapter, result in pairs:
+            rc = adapter.run_tests(result, extra, cwd=root)
+            if rc != 0:
+                code = rc
+        sys.exit(code)
 
 
 if __name__ == "__main__":

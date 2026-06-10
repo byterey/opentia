@@ -23,9 +23,9 @@ def _stash_pop():
 _stashed = _stash()
 
 
-def tia(extra_args=()):
+def tia(extra_args=(), root=None):
     r = subprocess.run(
-        [sys.executable, str(SCRIPT), "--unstaged", "--root", str(APP), "--output", "json", *extra_args],
+        [sys.executable, str(SCRIPT), "--unstaged", "--root", str(root or APP), "--output", "json", *extra_args],
         capture_output=True, text=True, cwd=str(REPO),
     )
     try:
@@ -239,6 +239,38 @@ try:
 finally:
     git_rm_cached(unk)
     unk.unlink(missing_ok=True)
+
+print("\n── Polyglot (java-fullstack-app: Maven + Angular) ────────────────────")
+
+FS = REPO / "java-fullstack-app"
+fs_ts = FS / "frontend/src/app/order-list/order-list.component.ts"
+fs_java = FS / "backend/src/main/java/com/example/backend/controller/OrderController.java"
+
+orig = patch(fs_ts)
+try:
+    result = tia(root=FS)
+    check("Frontend .ts change → frontend specs only", result,
+          expect_projects=["frontend"], exact=True)
+finally:
+    restore(fs_ts, orig)
+
+orig = patch(fs_java)
+try:
+    result = tia(root=FS)
+    check("Backend .java change → backend tests only", result,
+          expect_projects=["backend"], exact=True)
+finally:
+    restore(fs_java, orig)
+
+o1 = patch(fs_ts)
+o2 = patch(fs_java)
+try:
+    result = tia(root=FS)
+    check("Mixed .java + .ts change → both ecosystems", result,
+          expect_projects=["backend", "frontend"], exact=True)
+finally:
+    restore(fs_ts, o1)
+    restore(fs_java, o2)
 
 print("\n── No changes ────────────────────────────────────────────────────────")
 
