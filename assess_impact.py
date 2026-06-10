@@ -51,17 +51,19 @@ IGNORED_EXTENSIONS: Tuple[str, ...] = (
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
     ".pdf", ".docx", ".xls", ".xlsx",
     ".zip", ".tar", ".gz",
+    ".jks", ".keystore",           # Android signing keys
 )
 
 IGNORED_FILENAMES: Tuple[str, ...] = (
     ".gitignore", ".gitattributes", ".gitmodules",
     ".editorconfig",
     "license", "licence", "notice", "authors", "changelog",
+    "local.properties",            # Android: machine-specific SDK paths
 )
 
 EXCLUDED_DIRS: Tuple[str, ...] = (
     "obj", "bin", ".vs",           # .NET
-    "target", ".gradle",           # Java
+    "target", ".gradle", "build",  # Java / Gradle / Android
     "node_modules", "dist", ".next", ".nuxt", "coverage",  # Node
     ".git", ".idea", "packages", ".nuget",
 )
@@ -392,6 +394,11 @@ def strategy_dependency_graph(
 class LanguageAdapter(abc.ABC):
     language: str = "unknown"
 
+    # Build-file markers identifying this ecosystem. detect_adapters() scans
+    # the tree once for all adapters' markers instead of one walk per adapter.
+    marker_filenames: FrozenSet[str] = frozenset()
+    marker_suffixes: Tuple[str, ...] = ()
+
     @abc.abstractmethod
     def detect(self, root: Path) -> bool:
         """Return True if this adapter handles the project at root."""
@@ -524,7 +531,7 @@ _HUNK_HEADER_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@', re.MULT
 
 _CLASS_DECL_RE = re.compile(
     r'^\s*(?:(?:public|protected|private|internal|static|abstract|sealed|'
-    r'final|partial|new)\s+)*'
+    r'final|partial|new|data|open|inner|value|annotation|enum)\s+)*'
     r'(?:class|struct|record)\s+(\w+)'
 )
 
@@ -532,6 +539,7 @@ _CLASS_DECL_RE = re.compile(
 class DotNetAdapter(LanguageAdapter):
     language = "dotnet"
     method_decl_re = _DOTNET_METHOD_RE
+    marker_suffixes = (".csproj", ".sln")
 
     _INFRA_EXTS: Tuple[str, ...] = (".sln", ".csproj")
     _INFRA_NAMES: Tuple[str, ...] = (
@@ -777,6 +785,9 @@ _JAVA_TEST_PACKAGES: Set[str] = {
     "mockito-core", "mockito-junit-jupiter", "mockito-inline",
     "assertj-core", "hamcrest", "hamcrest-core", "hamcrest-library",
     "truth", "rest-assured",
+    # Android / Kotlin
+    "robolectric", "mockk", "espresso-core", "androidx.test",
+    "turbine", "kotlin-test", "kotest",
 }
 
 _JAVA_TYPE_DECL_RE = re.compile(
@@ -785,18 +796,43 @@ _JAVA_TYPE_DECL_RE = re.compile(
     r'(?:class|interface|enum|record|@interface)\s+(\w+)'
 )
 
+# Kotlin types are public by default — no modifier required.
+_KOTLIN_TYPE_DECL_RE = re.compile(
+    r'(?:^|\n)[ \t]*(?:@\w+(?:\([^)]*\))?[ \t]+)*'
+    r'(?:(?:public|internal|private|protected|abstract|final|open|sealed|'
+    r'data|inner|value|annotation|enum|expect|actual)\s+)*'
+    r'(?:class|interface|object)\s+(\w+)'
+)
+
 _JAVA_TEST_CLASS_RE = re.compile(r'\bclass\s+(\w+)')
 
-# Matches Java/Kotlin method declarations with at least one access modifier.
+# Matches Java method declarations (requires at least one modifier — bare
+# `Type name(` would also match call sites) and Kotlin fun declarations
+# (anchored by the `fun` keyword; modifiers optional, public by default).
 _JAVA_METHOD_RE = re.compile(
     r'^\s*'
     r'(?:@\w+(?:\([^)]*\))?\s+)*'
+    r'(?:'
+    r'(?:(?:public|internal|private|protected|open|override|suspend|inline|'
+    r'operator|infix|tailrec|actual|expect)\s+)*'
+    r'fun\s+(?:<[^>]*>\s+)?(?P<kt>\w+)\s*\('
+    r'|'
     r'(?:(?:public|protected|private|static|final|abstract|synchronized|'
     r'native|default|strictfp)\s+)+'
     r'(?:<[^>]*>\s+)?'
     r'(?:[\w<>\[\]?,\.]+\s+)*'
-    r'(\w+)\s*\('
+    r'(?P<jv>\w+)\s*\('
+    r')'
 )
+
+
+def _method_name(m: "re.Match") -> str:
+    """Method name from a method_decl_re match — handles both the named
+    kt/jv alternation groups and plain single-group regexes (.NET)."""
+    gd = m.groupdict()
+    if gd:
+        return gd.get("kt") or gd.get("jv") or m.group(1)
+    return m.group(1)
 
 
 class JavaAdapter(LanguageAdapter):
@@ -809,15 +845,23 @@ class JavaAdapter(LanguageAdapter):
         "settings.gradle", "settings.gradle.kts",
         "gradle.properties", "gradle-wrapper.properties",
         "gradlew", "gradlew.bat",
+        "libs.versions.toml",       # Gradle version catalog
     )
     _CONFIG_EXTS: Tuple[str, ...] = (
         ".xml", ".yaml", ".yml", ".json",
         ".properties", ".toml", ".ini",
+        ".pro",                     # proguard / R8 rules
+    )
+    # src/androidTest holds device-run (instrumented) tests; src/test runs on the JVM
+    _TEST_DIR_RELS: Tuple[str, ...] = (
+        "src/test/java", "src/test/kotlin", "src/test/groovy",
+        "src/androidTest/java", "src/androidTest/kotlin",
     )
 
     _BUILD_FILES: FrozenSet[str] = frozenset(
         {"pom.xml", "build.gradle", "build.gradle.kts"}
     )
+    marker_filenames = _BUILD_FILES
 
     def detect(self, root: Path) -> bool:
         return next(_iter_files(root, filenames=self._BUILD_FILES), None) is not None
@@ -918,10 +962,10 @@ class JavaAdapter(LanguageAdapter):
         is_test = False
         refs: List[str] = []
 
-        if (gradle_path.parent / "src" / "test" / "java").exists():
-            is_test = True
-        if (gradle_path.parent / "src" / "test" / "kotlin").exists():
-            is_test = True
+        for td_rel in self._TEST_DIR_RELS:
+            if (gradle_path.parent / td_rel.replace("/", os.sep)).exists():
+                is_test = True
+                break
 
         try:
             content = gradle_path.read_text(encoding="utf-8", errors="replace")
@@ -949,7 +993,12 @@ class JavaAdapter(LanguageAdapter):
         projects: List[Project] = []
         workspace_files: List[Path] = []
 
-        for pom in sorted(_iter_files(root, filenames=frozenset({"pom.xml"}))):
+        poms: List[Path] = []
+        gradles: List[Path] = []
+        for bf in sorted(_iter_files(root, filenames=self._BUILD_FILES)):
+            (poms if bf.name.lower() == "pom.xml" else gradles).append(bf)
+
+        for pom in poms:
             resolved = pom.resolve()
             if resolved in seen:
                 continue
@@ -960,8 +1009,7 @@ class JavaAdapter(LanguageAdapter):
         if root_pom.exists():
             workspace_files.append(root_pom)
 
-        gradle_names = frozenset({"build.gradle", "build.gradle.kts"})
-        for gradle in sorted(_iter_files(root, filenames=gradle_names)):
+        for gradle in gradles:
             resolved = gradle.resolve()
             if resolved in seen:
                 continue
@@ -978,7 +1026,7 @@ class JavaAdapter(LanguageAdapter):
     def build_test_file_cache(self, test_projects: List[Project]) -> Dict[Path, str]:
         cache: Dict[Path, str] = {}
         for proj in test_projects:
-            for test_dir_rel in ("src/test/java", "src/test/kotlin", "src/test/groovy"):
+            for test_dir_rel in self._TEST_DIR_RELS:
                 test_dir = proj.directory / test_dir_rel.replace("/", os.sep)
                 if test_dir.exists():
                     for f in _iter_files(test_dir, suffixes=self._SOURCE_EXTS):
@@ -990,7 +1038,8 @@ class JavaAdapter(LanguageAdapter):
         return cache
 
     def is_test_file(self, path: str) -> bool:
-        return "src/test/" in path.replace("\\", "/")
+        norm = path.replace("\\", "/")
+        return "src/test/" in norm or "src/androidTest/" in norm
 
     def strategy_convention(
         self, change: FileChange, test_projects: List[Project],
@@ -1006,7 +1055,7 @@ class JavaAdapter(LanguageAdapter):
             candidates = [f"{stem}Test", f"{stem}Tests", f"{stem}IT", f"{stem}Spec"]
             cand_by_stem = {c.lower(): c for c in candidates}
             for proj in test_projects:
-                for td_rel in ("src/test/java", "src/test/kotlin", "src/test/groovy"):
+                for td_rel in self._TEST_DIR_RELS:
                     td = proj.directory / td_rel.replace("/", os.sep)
                     if not td.exists():
                         continue
@@ -1040,7 +1089,12 @@ class JavaAdapter(LanguageAdapter):
         except OSError:
             return []
 
-        symbols = list(dict.fromkeys(_JAVA_TYPE_DECL_RE.findall(source)))[:20]
+        type_re = (
+            _KOTLIN_TYPE_DECL_RE
+            if file_abs.suffix.lower() in (".kt", ".kts")
+            else _JAVA_TYPE_DECL_RE
+        )
+        symbols = list(dict.fromkeys(type_re.findall(source)))[:20]
         if not symbols:
             return []
 
@@ -1085,6 +1139,25 @@ class JavaAdapter(LanguageAdapter):
         d = Path(proj_path).parent
         return (d / "build.gradle").exists() or (d / "build.gradle.kts").exists()
 
+    def _split_instrumented(
+        self, proj_path: str, classes: Set[str],
+    ) -> Tuple[Set[str], Set[str]]:
+        """Split class filters into (unit, instrumented) — instrumented test
+        classes live under src/androidTest and need the connectedAndroidTest
+        task (device/emulator) instead of the JVM test task."""
+        at_names: Set[str] = set()
+        proj_dir = Path(proj_path).parent
+        for sub in ("src/androidTest/java", "src/androidTest/kotlin"):
+            d = proj_dir / sub.replace("/", os.sep)
+            if d.exists():
+                at_names.update(
+                    f.stem for f in _iter_files(d, suffixes=self._SOURCE_EXTS)
+                )
+        if not at_names:
+            return set(classes), set()
+        instr = {c for c in classes if c.split(".")[0] in at_names}
+        return set(classes) - instr, instr
+
     def _has_gradlew(self, cwd: Optional[Path]) -> bool:
         base = cwd or Path(".")
         return (base / "gradlew").exists() or (base / "gradlew.bat").exists()
@@ -1110,20 +1183,33 @@ class JavaAdapter(LanguageAdapter):
         for proj_path in result.test_project_paths:
             module_name = Path(proj_path).parent.name
             is_gradle = self._is_gradle_project(proj_path)
+            cmds: List[List[str]] = []
             if is_gradle:
                 gradle = "./gradlew" if self._has_gradlew(cwd) else "gradle"
-                filter_args = (
-                    [f"--tests={c}" for c in sorted(result.affected_test_classes)]
-                    if result.test_filter else []
-                )
-                cmd = [gradle, f":{module_name}:test", *filter_args, *extra_args]
+                if result.test_filter:
+                    unit, instr = self._split_instrumented(
+                        proj_path, result.affected_test_classes
+                    )
+                    if unit:
+                        cmds.append([
+                            gradle, f":{module_name}:test",
+                            *(f"--tests={c}" for c in sorted(unit)), *extra_args,
+                        ])
+                    if instr:
+                        cmds.append([
+                            gradle, f":{module_name}:connectedAndroidTest",
+                            *(f"--tests={c}" for c in sorted(instr)), *extra_args,
+                        ])
+                if not cmds:
+                    cmds.append([gradle, f":{module_name}:test", *extra_args])
             else:
                 filter_args = [f"-Dtest={result.test_filter}"] if result.test_filter else []
-                cmd = ["mvn", "test", "-pl", f":{module_name}", *filter_args, *extra_args]
-            print(f"\n[RUN] {' '.join(cmd)}\n")
-            rc = subprocess.call(cmd, cwd=str(cwd) if cwd else None)
-            if rc != 0:
-                code = rc
+                cmds.append(["mvn", "test", "-pl", f":{module_name}", *filter_args, *extra_args])
+            for cmd in cmds:
+                print(f"\n[RUN] {' '.join(cmd)}\n")
+                rc = subprocess.call(cmd, cwd=str(cwd) if cwd else None)
+                if rc != 0:
+                    code = rc
         return code
 
     def fmt_command(self, result: ImpactResult) -> str:
@@ -1138,10 +1224,17 @@ class JavaAdapter(LanguageAdapter):
             gradle = self._is_gradle_project(proj_path)
             if gradle:
                 if result.test_filter:
-                    filters = " ".join(
-                        f'--tests="{c}"' for c in sorted(result.affected_test_classes)
+                    unit, instr = self._split_instrumented(
+                        proj_path, result.affected_test_classes
                     )
-                    parts.append(f'./gradlew :{module_name}:test {filters}')
+                    if unit:
+                        filters = " ".join(f'--tests="{c}"' for c in sorted(unit))
+                        parts.append(f'./gradlew :{module_name}:test {filters}')
+                    if instr:
+                        filters = " ".join(f'--tests="{c}"' for c in sorted(instr))
+                        parts.append(
+                            f'./gradlew :{module_name}:connectedAndroidTest {filters}'
+                        )
                 else:
                     parts.append(f'./gradlew :{module_name}:test')
             else:
@@ -1171,6 +1264,7 @@ _NODE_SYMBOL_RE = re.compile(
 
 class NodeAdapter(LanguageAdapter):
     language = "node"
+    marker_filenames = frozenset({"package.json"})
 
     _SOURCE_EXTS: Tuple[str, ...] = (
         ".js", ".ts", ".jsx", ".tsx",
@@ -1557,7 +1651,26 @@ def detect_adapters(root: Path, lang_hint: Optional[str] = None) -> List[Languag
         if cls:
             return [cls()]
         print(f"[WARN] Unknown --lang '{lang_hint}', auto-detecting.", file=sys.stderr)
-    found = [adapter for adapter in _ADAPTERS if adapter.detect(root)]
+    # One tree walk for all adapters' markers instead of one walk each —
+    # proving an ecosystem absent costs a full walk per adapter otherwise.
+    all_names = frozenset().union(*(a.marker_filenames for a in _ADAPTERS))
+    all_suffixes = tuple(s for a in _ADAPTERS for s in a.marker_suffixes)
+    pending = list(_ADAPTERS)
+    found: List[LanguageAdapter] = []
+    for f in _iter_files(
+        root, filenames=all_names, suffixes=all_suffixes,
+        excluded=_NODE_EXCLUDED_DIRS,
+    ):
+        low = f.name.lower()
+        for adapter in list(pending):
+            if low in adapter.marker_filenames or (
+                adapter.marker_suffixes and low.endswith(adapter.marker_suffixes)
+            ):
+                pending.remove(adapter)
+                found.append(adapter)
+        if not pending:
+            break
+    found.sort(key=_ADAPTERS.index)
     return found or [DotNetAdapter()]  # safe fallback
 
 
@@ -1669,7 +1782,7 @@ def _extract_changed_methods(
     for i, line in enumerate(lines, 1):
         m = method_re.match(line)
         if m:
-            method_starts.append((i, m.group(1)))
+            method_starts.append((i, _method_name(m)))
     if not method_starts:
         return []
 
@@ -1714,8 +1827,27 @@ def _find_method_owners(
             class_stack.append((cls_m.group(1), depth - opens))
         meth_m = method_re.match(line)
         if meth_m and class_stack:
-            result[lineno] = (class_stack[-1][0], meth_m.group(1))
+            result[lineno] = (class_stack[-1][0], _method_name(meth_m))
     return result
+
+
+def _is_test_annotated(lines: List[str], decl_lineno: int) -> bool:
+    """True if the method declared at decl_lineno (1-based) is preceded by a
+    test annotation/attribute (@Test, [Fact], [Theory], @ParameterizedTest, …)."""
+    i = decl_lineno - 2
+    while i >= 0:
+        s = lines[i].strip()
+        if not s:
+            i -= 1
+            continue
+        if s.startswith(("@", "[")):
+            low = s.lower()
+            if "test" in low or "fact" in low or "theory" in low:
+                return True
+            i -= 1
+            continue
+        return False
+    return False
 
 
 def _extract_changed_method_owners(
@@ -1724,8 +1856,9 @@ def _extract_changed_method_owners(
     use_working_tree: bool,
     git_root: Path,
     method_re: re.Pattern,
-) -> List[Tuple[str, str]]:
-    """Return (class_name, method_name) pairs for methods with at least one changed line."""
+) -> List[Tuple[str, str, bool]]:
+    """Return (class_name, method_name, is_test_annotated) triples for methods
+    with at least one changed line."""
     try:
         rel = str(file_abs.relative_to(git_root))
     except ValueError:
@@ -1762,15 +1895,20 @@ def _extract_changed_method_owners(
         return []
 
     line_nos = sorted(owners)
-    found: Set[Tuple[str, str]] = set()
+    found: Set[Tuple[str, str, bool]] = set()
+
+    def _add(lineno: int) -> None:
+        cls, mth = owners[lineno]
+        found.add((cls, mth, _is_test_annotated(lines, lineno)))
+
     for rng_start, rng_end in changed_ranges:
         idx = bisect.bisect_right(line_nos, rng_start) - 1
         if idx >= 0:
-            found.add(owners[line_nos[idx]])
+            _add(line_nos[idx])
         lo = bisect.bisect_left(line_nos, rng_start)
         hi = bisect.bisect_right(line_nos, rng_end)
         for i in range(lo, hi):
-            found.add(owners[line_nos[i]])
+            _add(line_nos[i])
     return sorted(found)
 
 
@@ -1791,7 +1929,7 @@ def _find_test_methods_in_cache(
         for line in content.splitlines():
             m = method_re.match(line)
             if m:
-                name = m.group(1)
+                name = _method_name(m)
                 if name in seen:
                     continue
                 if any(needle in name.lower() for needle in needles):
@@ -1983,12 +2121,16 @@ def assess(
                                 # Keep only owners whose class is a known test class
                                 test_class_set = set(test_classes)
                                 matched = [
-                                    (cls, mth)
-                                    for cls, mth in owners
+                                    (cls, mth, annotated)
+                                    for cls, mth, annotated in owners
                                     if cls in test_class_set
                                 ]
-                                if matched:
-                                    for cls, mth in matched:
+                                # Narrow to methods only when every changed
+                                # method is an actual test — a changed helper
+                                # affects the whole class, and a filter naming
+                                # it would run zero tests.
+                                if matched and all(a for _, _, a in matched):
+                                    for cls, mth, _ in matched:
                                         local_classes.add(f"{cls}.{mth}")
                                 else:
                                     local_classes.update(test_classes)

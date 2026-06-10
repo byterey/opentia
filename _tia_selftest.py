@@ -320,6 +320,98 @@ try:
 finally:
     restore(jca_src, orig)
 
+print("\n── Android (Kotlin, nested Gradle modules) ───────────────────────────")
+
+AND = REPO / "android-app"
+
+# Nested project(":core:model") refs must resolve so dependents run
+and_src = AND / "core/model/src/main/java/com/example/core/model/Money.kt"
+orig = patch(and_src)
+try:
+    result = tia(root=AND)
+    check("Kotlin core change → model + checkout + app (nested refs)", result,
+          expect_projects=["model", "checkout", "app"], exact=True)
+finally:
+    restore(and_src, orig)
+
+# Symbol search must understand modifier-less Kotlin declarations:
+# Discount has no DiscountTest by convention; only MoneyTest references it
+and_src = AND / "core/model/src/main/java/com/example/core/model/Discount.kt"
+orig = patch(and_src)
+try:
+    result = tia(root=AND)
+    ids = {i.split(".")[0] for i in result.get("affected_test_classes", [])}
+    ok = "MoneyTest" in ids
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] Kotlin symbol search → MoneyTest found for Discount change")
+    if not ok:
+        print(f"         identifiers: {sorted(ids)}")
+finally:
+    restore(and_src, orig)
+
+# Instrumented tests under src/androidTest must be discovered and routed
+# to the connectedAndroidTest task
+and_src = AND / "app/src/main/java/com/example/app/CheckoutScreen.kt"
+orig = patch(and_src)
+try:
+    result = tia(root=AND)
+    ids = {i.split(".")[0] for i in result.get("affected_test_classes", [])}
+    cmd = result.get("test_command", "")
+    ok = "CheckoutScreenTest" in ids and "connectedAndroidTest" in cmd
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] androidTest source → CheckoutScreenTest + connectedAndroidTest")
+    if not ok:
+        print(f"         identifiers: {sorted(ids)}")
+        print(f"         test_command: {cmd}")
+finally:
+    restore(and_src, orig)
+
+# Changing a non-@Test helper inside a test class must widen to the whole
+# class — a filter naming the helper would run zero tests
+and_src = AND / "app/src/test/java/com/example/app/MainViewModelTest.kt"
+orig = patch(and_src)
+try:
+    result = tia(root=AND)
+    ids = set(result.get("affected_test_classes", []))
+    ok = "MainViewModelTest" in ids and not any(
+        i.startswith("MainViewModelTest.") for i in ids
+    )
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] Helper change in test class → class-level filter")
+    if not ok:
+        print(f"         identifiers: {sorted(ids)}")
+finally:
+    restore(and_src, orig)
+
+# local.properties is machine-specific — never run tests for it
+lp = AND / "local.properties"
+lp.write_text("sdk.dir=C:/fake/android/sdk\n", encoding="utf-8")
+git_add(lp)
+try:
+    result = tia(root=AND)
+    check("local.properties change → no tests", result, no_tests=True)
+finally:
+    git_rm_cached(lp)
+    lp.unlink(missing_ok=True)
+
+# Version catalog is workspace-level INFRA
+cat = AND / "gradle/libs.versions.toml"
+orig = patch(cat, "\n# tia-test\n")
+try:
+    result = tia(root=AND)
+    check("libs.versions.toml change → run_all", result, run_all=True)
+finally:
+    restore(cat, orig)
+
 print("\n── Plain-version workspace deps (pnpm/lerna style) ───────────────────")
 
 # Internal dep declared with a plain semver range (no workspace:/file:
