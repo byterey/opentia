@@ -87,13 +87,25 @@ opentia --base HEAD~1 --root . --output azure-devops
   "test_project_paths": ["...SampleApp.Services.Tests.csproj"],
   "affected_test_projects": ["SampleApp.Services.Tests"],
   "affected_test_classes": ["PricingServiceTests"],
-  "test_command": "dotnet test \"...\" --filter \"...\"",
+  "test_command": "dotnet test \"...\" --filter \"...\" --logger trx",
+  "test_result_paths": [".../TestResults/*.trx"],  // result globs for CI
   "reason": "Analysis complete",
   "strategy_notes": []            // warnings / fallback explanations
 }
 ```
 
 When changes span multiple ecosystems in one run, the same fields are emitted merged at the top level (`language: "java,node"`, `test_command` joined with `&&`) plus a `results` array containing one full per-language object each.
+
+### Test results & artifacts
+
+`test_result_paths` lists posix-style globs where the runner writes result files, so CI can upload/publish exactly the tests that ran:
+
+| Runner | Emits results by default? | Glob |
+|---|---|---|
+| Gradle (incl. Android) | yes | `<module>/build/test-results/<task>/TEST-*.xml` — variant-aware (`testDebugUnitTest` for Android unit, `test` for plain JVM); `build/outputs/androidTest-results/` for instrumented |
+| Maven | yes | `<module>/target/surefire-reports/TEST-*.xml` |
+| .NET | **with `--logger`** | opentia defaults the command to `--logger trx` (built-in), so `<project>/TestResults/*.trx` is produced; pass your own `-- --logger ...` to override |
+| Node (Jest/Vitest) | no | best-effort common locations only — JUnit XML requires a reporter you configure (`jest-junit`, or vitest `--reporter=junit --outputFile=`) |
 
 ---
 
@@ -155,9 +167,24 @@ jobs:
         env:
           TEST_COMMAND: ${{ steps.tia.outputs.test_command }}
         run: bash -c "$TEST_COMMAND"
+
+      # Publish only the results of the tests that ran (test_result_paths is a
+      # newline-separated list of globs — drops straight into upload-artifact).
+      - name: Upload test results
+        if: always() && steps.tia.outputs.has_tests == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ${{ steps.tia.outputs.test_result_paths }}
+
+      - name: Publish test report
+        if: always() && steps.tia.outputs.has_tests == 'true'
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: ${{ steps.tia.outputs.test_result_paths }}
 ```
 
-Available outputs: `test_filter`, `run_all`, `has_tests`, `test_project_paths`, `test_command`.
+Available outputs: `test_filter`, `run_all`, `has_tests`, `test_project_paths`, `test_command`, `test_result_paths`.
 
 > **Security:** pass `test_command` through an `env:` variable and run `bash -c "$TEST_COMMAND"`, rather than interpolating `${{ … }}` directly into `run:`. opentia shell-quotes the command components (so the string is safe to evaluate in a POSIX shell), but textual `${{ }}` interpolation pastes the value into the script *before* the shell parses it — the env-indirection keeps a repo-controlled file or directory name from ever being re-parsed as workflow/shell syntax. The emitted command targets a POSIX shell (`bash`); on Windows runners, set `shell: bash`.
 
@@ -184,6 +211,12 @@ Available outputs: `test_filter`, `run_all`, `has_tests`, `test_project_paths`, 
 - script: $(testCommand)
   condition: eq(variables['hasTests'], 'true')
   displayName: Run affected tests
+
+- task: PublishTestResults@2
+  condition: and(always(), eq(variables['hasTests'], 'true'))
+  inputs:
+    testResultsFormat: JUnit          # use 'VSTest' for .NET (.trx)
+    testResultsFiles: $(testResultPaths)   # comma-separated globs
 ```
 
-Available variables: `testFilter`, `runAllTests`, `hasTests`, `testProjectPaths`, `testCommand`.
+Available variables: `testFilter`, `runAllTests`, `hasTests`, `testProjectPaths`, `testCommand`, `testResultPaths`.
