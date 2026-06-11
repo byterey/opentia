@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Test Impact Analysis (TIA) — multi-language v3
-===============================================
-Supports: C# / .NET, Java (Maven + Gradle), Node.js (JS / TS)
+Test Impact Analysis (TIA) — multi-language
+===========================================
+Selects only the tests affected by a git diff. Stdlib only, no dependencies.
+
+Ecosystems (auto-detected; polyglot repos handled in one run):
+  - C# / .NET           .sln / .csproj
+  - Java / Android      Maven (pom.xml) + Gradle (build.gradle[.kts]); Kotlin,
+                        nested modules, src/androidTest → connected tests
+  - Node.js             Jest / Vitest / npm test scripts; npm/pnpm/lerna workspaces
 
 Three layered strategies (all active in "hybrid" mode):
   1. Project dependency graph  — parse build files to find which test
@@ -13,8 +19,9 @@ Three layered strategies (all active in "hybrid" mode):
 
 Usage:
     python assess_impact.py --base HEAD~1 [--root DIR] [--lang dotnet|java|node]
-    python assess_impact.py --base HEAD~1 --output json
-    python assess_impact.py --unstaged
+    python assess_impact.py --base HEAD~1 --output json   # adds test_result_paths
+    python assess_impact.py --unstaged          # working tree (staged + unstaged)
+    python assess_impact.py --staged            # index only
     python assess_impact.py --base HEAD~1 --run
     python assess_impact.py --base HEAD~1 --run -- --no-build
 """
@@ -2774,14 +2781,18 @@ def build_parser() -> argparse.ArgumentParser:
         prog="assess_impact.py",
         description=(
             "Test Impact Analysis — detect which tests to run based on code changes.\n"
-            "Supports: C# / .NET, Java (Maven + Gradle), Node.js (Jest / Vitest)"
+            "Supports: C# / .NET, Java / Android (Maven + Gradle), Node.js (Jest / Vitest).\n"
+            "Polyglot repos are analysed in a single run."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-language adapters (auto-detected by default):
-  dotnet   C# / .NET — project dependency graph via .sln/.csproj
-  java     Java / Kotlin — Maven pom.xml and/or Gradle build.gradle
-  node     JavaScript / TypeScript — npm/yarn/pnpm + Jest/Vitest
+language adapters (auto-detected; all matching ones run in a polyglot repo):
+  dotnet   C# / .NET — dependency graph via .sln/.csproj
+  java     Java / Kotlin / Android — Maven pom.xml and/or Gradle build.gradle;
+           Android modules use :module:testDebugUnitTest, src/androidTest →
+           connectedDebugAndroidTest
+  node     JavaScript / TypeScript — npm/pnpm/lerna workspaces; Jest / Vitest,
+           or a package's own `test` script (karma, ng test, …)
 
 strategies:
   project    Project dependency graph only (fastest, least precise)
@@ -2789,24 +2800,26 @@ strategies:
   symbol     Symbol-grep only (public types → test references)
   hybrid     All three combined (default, recommended)
 
-output formats:
+output formats (all include test_result_paths for CI artifact publishing):
   human          Human-readable report (default)
-  json           Machine-readable JSON
+  json           Machine-readable JSON (adds a `results` array for polyglot)
   github-actions Shell commands to set GitHub Actions step outputs
   azure-devops   Shell commands to set Azure DevOps pipeline variables
 
 examples:
-  # .NET
-  python assess_impact.py --base HEAD~1 --root sample-app
-  python assess_impact.py --base HEAD~1 --root sample-app --run
+  # Any ecosystem, auto-detected from --root
+  python assess_impact.py --base HEAD~1 --root my-app
+  python assess_impact.py --base HEAD~1 --root my-app --run
 
-  # Java (auto-detected from pom.xml / build.gradle)
-  python assess_impact.py --base HEAD~1 --root my-java-app
-  python assess_impact.py --base HEAD~1 --root my-java-app --lang java
+  # Android / Gradle module (wrapper + variant tasks resolved automatically)
+  python assess_impact.py --unstaged --root app --run
 
-  # Node.js (auto-detected from package.json)
-  python assess_impact.py --base HEAD~1 --root my-node-app
-  python assess_impact.py --base HEAD~1 --root my-node-app --lang node
+  # Staged-only (pre-commit), and forcing one adapter
+  python assess_impact.py --staged --root my-app
+  python assess_impact.py --base HEAD~1 --root my-app --lang java
+
+  # CI: machine-readable selection + result globs
+  python assess_impact.py --base origin/main --output github-actions
 
   # Universal
   python assess_impact.py --base origin/main --output json

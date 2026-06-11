@@ -12,7 +12,11 @@ license = {text = "MIT"}
 authors = [
     {name = "byterey", email = "byterey@gmail.com"},
 ]
-keywords = ["testing", "test-impact-analysis", "dotnet", "csharp", "java", "nodejs", "tia"]
+keywords = [
+    "testing", "test-impact-analysis", "tia", "ci", "monorepo",
+    "dotnet", "csharp", "java", "kotlin", "android", "gradle", "maven",
+    "nodejs", "jest", "vitest",
+]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
