@@ -152,10 +152,14 @@ jobs:
 
       - name: Run affected tests
         if: steps.tia.outputs.has_tests == 'true'
-        run: ${{ steps.tia.outputs.test_command }}
+        env:
+          TEST_COMMAND: ${{ steps.tia.outputs.test_command }}
+        run: bash -c "$TEST_COMMAND"
 ```
 
 Available outputs: `test_filter`, `run_all`, `has_tests`, `test_project_paths`, `test_command`.
+
+> **Security:** pass `test_command` through an `env:` variable and run `bash -c "$TEST_COMMAND"`, rather than interpolating `${{ … }}` directly into `run:`. opentia shell-quotes the command components (so the string is safe to evaluate in a POSIX shell), but textual `${{ }}` interpolation pastes the value into the script *before* the shell parses it — the env-indirection keeps a repo-controlled file or directory name from ever being re-parsed as workflow/shell syntax. The emitted command targets a POSIX shell (`bash`); on Windows runners, set `shell: bash`.
 
 ### GitHub Actions — push to branch
 
@@ -166,7 +170,9 @@ Available outputs: `test_filter`, `run_all`, `has_tests`, `test_project_paths`, 
 
 - name: Run affected tests
   if: steps.tia.outputs.has_tests == 'true'
-  run: ${{ steps.tia.outputs.test_command }}
+  env:
+    TEST_COMMAND: ${{ steps.tia.outputs.test_command }}
+  run: bash -c "$TEST_COMMAND"
 ```
 
 ### Azure DevOps
