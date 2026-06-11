@@ -525,6 +525,34 @@ try:
 finally:
     restore(np_src, orig)
 
+print("\n── Gradle wrapper resolution (run from a module subdir) ─────────────")
+
+# The gradlew wrapper lives at the settings.gradle root, commonly an
+# ancestor of --root. Resolution must find it (preferring .bat on Windows)
+# and never fall back to bare 'gradle' when a wrapper exists.
+import os as _os
+_liba_build = REPO / "gradle-nested/workspace/libs/liba/build.gradle.kts"
+try:
+    launcher, run_dir = _ai.JavaAdapter()._gradle_launcher(str(_liba_build))
+    lp = Path(launcher)
+    expected_name = "gradlew.bat" if _os.name == "nt" else "gradlew"
+    ok = (
+        lp.name == expected_name
+        and lp.exists()
+        and lp.parent.name == "workspace"
+        and run_dir is not None and Path(run_dir).name == "workspace"
+    )
+except AttributeError as e:
+    ok = False
+    launcher = f"<missing: {e}>"
+if ok:
+    PASS += 1
+else:
+    FAIL += 1
+print(f"  [{'PASS' if ok else 'FAIL'}] Wrapper resolved at build root, not bare 'gradle'")
+if not ok:
+    print(f"         launcher: {launcher}")
+
 print("\n── Security: shell-safe test_command rendering ──────────────────────")
 
 # A path / module / filter carrying shell metacharacters must be rendered

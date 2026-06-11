@@ -1262,22 +1262,45 @@ class JavaAdapter(LanguageAdapter):
         instr = {c for c in classes if c.split(".")[0] in instr_names}
         return unit, instr
 
-    def _has_gradlew(self, cwd: Optional[Path]) -> bool:
-        base = cwd or Path(".")
-        return (base / "gradlew").exists() or (base / "gradlew.bat").exists()
+    def _gradle_wrapper(self, groot: Optional[Path]) -> str:
+        """Path to the gradle wrapper at the build root, or 'gradle' on PATH.
+        Prefers gradlew.bat on Windows; the wrapper is invoked by absolute
+        path (subprocess can't find a repo-root wrapper from a module cwd)."""
+        if groot is not None:
+            names = ("gradlew.bat", "gradlew") if os.name == "nt" else ("gradlew",)
+            for name in names:
+                w = groot / name
+                if w.exists():
+                    return str(w)
+        return "gradle.bat" if os.name == "nt" else "gradle"
+
+    def _gradle_launcher(self, proj_path: str) -> Tuple[str, Optional[Path]]:
+        """Return (launcher, run_dir) for a gradle module. run_dir is the
+        build root so the wrapper resolves the project and `:a:b:test` tasks
+        regardless of --root."""
+        groot = self._gradle_root(Path(proj_path).parent)
+        return self._gradle_wrapper(groot), groot
 
     def run_tests(
         self, result: ImpactResult, extra_args: List[str], cwd: Optional[Path],
     ) -> int:
         if result.run_all and not result.test_filter:
-            is_gradle = any("gradle" in Path(f).name.lower() for f in result.workspace_files)
+            is_gradle = (
+                any("gradle" in Path(f).name.lower() for f in result.workspace_files)
+                or any(self._is_gradle_project(p) for p in result.test_project_paths)
+            )
             if is_gradle:
-                gradle = "./gradlew" if self._has_gradlew(cwd) else "gradle"
-                cmd = [gradle, "test", *extra_args]
+                launcher, run_dir = self._gradle_launcher(
+                    result.test_project_paths[0] if result.test_project_paths
+                    else str((cwd or Path(".")) / "build.gradle")
+                )
+                cmd = [launcher, "test", *extra_args]
+                run_cwd = run_dir or cwd
             else:
                 cmd = ["mvn", "test", *extra_args]
+                run_cwd = cwd
             print(f"\n[RUN] {' '.join(cmd)}\n")
-            return subprocess.call(cmd, cwd=str(cwd) if cwd else None)
+            return subprocess.call(cmd, cwd=str(run_cwd) if run_cwd else None)
 
         if not result.test_project_paths:
             print("[INFO] No tests to run.", file=sys.stderr)
@@ -1291,8 +1314,10 @@ class JavaAdapter(LanguageAdapter):
             module_name = name_by_path.get(proj_path, Path(proj_path).parent.name)
             is_gradle = self._is_gradle_project(proj_path)
             cmds: List[List[str]] = []
+            run_cwd: Optional[Path] = cwd
             if is_gradle:
-                gradle = "./gradlew" if self._has_gradlew(cwd) else "gradle"
+                launcher, run_dir = self._gradle_launcher(proj_path)
+                run_cwd = run_dir or cwd
                 mp = self._gradle_module_path(proj_path)
                 test_task = f":{mp}:test" if mp else "test"
                 connected_task = f":{mp}:connectedAndroidTest" if mp else "connectedAndroidTest"
@@ -1302,16 +1327,16 @@ class JavaAdapter(LanguageAdapter):
                     )
                     if unit:
                         cmds.append([
-                            gradle, test_task,
+                            launcher, test_task,
                             *(f"--tests={c}" for c in sorted(unit)), *extra_args,
                         ])
                     if instr:
                         cmds.append([
-                            gradle, connected_task,
+                            launcher, connected_task,
                             *(f"--tests={c}" for c in sorted(instr)), *extra_args,
                         ])
                 if not cmds:
-                    cmds.append([gradle, test_task, *extra_args])
+                    cmds.append([launcher, test_task, *extra_args])
             else:
                 filter_args: List[str] = []
                 if result.test_filter:
@@ -1327,7 +1352,7 @@ class JavaAdapter(LanguageAdapter):
                 cmds.append(["mvn", "test", "-pl", f":{module_name}", *filter_args, *extra_args])
             for cmd in cmds:
                 print(f"\n[RUN] {' '.join(cmd)}\n")
-                rc = subprocess.call(cmd, cwd=str(cwd) if cwd else None)
+                rc = subprocess.call(cmd, cwd=str(run_cwd) if run_cwd else None)
                 if rc != 0:
                     code = rc
         return code
