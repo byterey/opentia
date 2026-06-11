@@ -205,7 +205,10 @@ def _parse_name_status(out: str) -> List[FileChange]:
     return changes
 
 
-_GIT_REF_RE = re.compile(r'^[A-Za-z0-9_./:@^~{}\[\]\\-]{1,250}$')
+# Leading dash is rejected: a ref like '-S' positioned before '--' is parsed
+# by git as an option, not a revision (argument injection). Real refs never
+# start with '-' (git check-ref-format forbids it).
+_GIT_REF_RE = re.compile(r'^(?!-)[A-Za-z0-9_./:@^~{}\[\]\\-]{1,250}$')
 
 
 def _validate_ref(ref: str, name: str) -> str:
@@ -220,7 +223,7 @@ def get_changed_files(
 ) -> List[FileChange]:
     try:
         out = _run_git(
-            "diff", "--name-status", "--diff-filter=DACMRT",
+            "diff", "--name-status", "--diff-filter=DACMRT", "--end-of-options",
             _validate_ref(base_ref, "--base"), _validate_ref(head_ref, "--head"),
             "--", cwd=git_root,
         )
@@ -256,6 +259,15 @@ def get_changed_files_working_tree(
 
 def _excluded(path: Path) -> bool:
     return any(part in EXCLUDED_DIRS for part in path.parts)
+
+
+def _shq(value: object) -> str:
+    """POSIX-shell-quote a token for the rendered test_command. The command
+    string is surfaced to CI, which executes it via shell expansion
+    (`run: ${{ steps.tia.outputs.test_command }}`); paths, module names, and
+    runner filters all derive from repo-controlled names and must not be able
+    to inject shell syntax there."""
+    return shlex.quote(str(value))
 
 
 def _in_hidden_dir(path: str) -> bool:
@@ -649,6 +661,8 @@ class DotNetAdapter(LanguageAdapter):
         cache: Dict[Path, str] = {}
         for proj in test_projects:
             for cs in _iter_files(proj.directory, suffixes=(".cs",)):
+                if cs.is_symlink():
+                    continue
                 if cs not in cache:
                     try:
                         cache[cs] = cs.read_text(encoding="utf-8", errors="replace")
@@ -791,15 +805,15 @@ class DotNetAdapter(LanguageAdapter):
     def fmt_command(self, result: ImpactResult) -> str:
         if result.run_all and not result.test_filter:
             if result.workspace_files:
-                return " && ".join(f'dotnet test "{s}"' for s in result.workspace_files)
+                return " && ".join(f"dotnet test {_shq(s)}" for s in result.workspace_files)
             return "dotnet test"
         if not result.test_project_paths:
             return "(no tests to run)"
         parts = []
         for p in result.test_project_paths:
             proj_filter = self._project_filter(p, result)
-            filter_part = f' --filter "{proj_filter}"' if proj_filter else ""
-            parts.append(f'dotnet test "{p}"{filter_part}')
+            filter_part = f" --filter {_shq(proj_filter)}" if proj_filter else ""
+            parts.append(f"dotnet test {_shq(p)}{filter_part}")
         return " && ".join(parts)
 
 
@@ -1088,6 +1102,8 @@ class JavaAdapter(LanguageAdapter):
                 test_dir = proj.directory / test_dir_rel.replace("/", os.sep)
                 if test_dir.exists():
                     for f in _iter_files(test_dir, suffixes=self._SOURCE_EXTS):
+                        if f.is_symlink():
+                            continue
                         if f not in cache:
                             try:
                                 cache[f] = f.read_text(encoding="utf-8", errors="replace")
@@ -1336,15 +1352,15 @@ class JavaAdapter(LanguageAdapter):
                         proj_path, result.affected_test_classes
                     )
                     if unit:
-                        filters = " ".join(f'--tests="{c}"' for c in sorted(unit))
-                        parts.append(f'./gradlew {test_task} {filters}')
+                        filters = " ".join(f"--tests={_shq(c)}" for c in sorted(unit))
+                        parts.append(f"./gradlew {_shq(test_task)} {filters}")
                     if instr:
-                        filters = " ".join(f'--tests="{c}"' for c in sorted(instr))
-                        parts.append(f'./gradlew {connected_task} {filters}')
+                        filters = " ".join(f"--tests={_shq(c)}" for c in sorted(instr))
+                        parts.append(f"./gradlew {_shq(connected_task)} {filters}")
                     if not unit and not instr:
-                        parts.append(f'./gradlew {test_task}')
+                        parts.append(f"./gradlew {_shq(test_task)}")
                 else:
-                    parts.append(f'./gradlew {test_task}')
+                    parts.append(f"./gradlew {_shq(test_task)}")
             else:
                 filter_str = ""
                 if result.test_filter:
@@ -1356,8 +1372,8 @@ class JavaAdapter(LanguageAdapter):
                             c.replace(".", "#", 1) if "." in c else c
                             for c in sorted(unit)
                         )
-                        filter_str = f' -Dtest="{surefire}"'
-                parts.append(f'mvn test -pl ":{module_name}"{filter_str}')
+                        filter_str = f" -Dtest={_shq(surefire)}"
+                parts.append(f"mvn test -pl {_shq(':' + module_name)}{filter_str}")
         return " && ".join(parts)
 
 
@@ -1527,6 +1543,8 @@ class NodeAdapter(LanguageAdapter):
             for f in _iter_files(
                 proj.directory, suffixes=self._SOURCE_EXTS, excluded=_NODE_EXCLUDED_DIRS,
             ):
+                if f.is_symlink():
+                    continue
                 if self.is_test_file(str(f)) and f not in cache:
                     try:
                         cache[f] = f.read_text(encoding="utf-8", errors="replace")
@@ -1744,7 +1762,7 @@ class NodeAdapter(LanguageAdapter):
             if not result.test_project_paths:
                 return "npm test"
             return " && ".join(
-                f'npm test --prefix "{Path(p).parent}"'
+                f"npm test --prefix {_shq(Path(p).parent)}"
                 for p in result.test_project_paths
             )
         base = f"npx {runner}" + (" run" if runner == "vitest" else "")
@@ -1752,7 +1770,7 @@ class NodeAdapter(LanguageAdapter):
             return base
         if not result.test_project_paths:
             return "(no tests to run)"
-        return f'{base} "{result.test_filter}"' if result.test_filter else base
+        return f"{base} {_shq(result.test_filter)}" if result.test_filter else base
 
 
 # ---------------------------------------------------------------------------
@@ -1871,11 +1889,11 @@ def _extract_changed_methods(
         rel = str(file_abs.relative_to(git_root))
     except ValueError:
         return []
-    effective_base = base_ref if base_ref else "HEAD~1"
+    effective_base = _validate_ref(base_ref, "--base") if base_ref else "HEAD~1"
     cmd = (
         ["git", "diff", "--unified=0", "--", rel]
         if use_working_tree
-        else ["git", "diff", "--unified=0", effective_base, "--", rel]
+        else ["git", "diff", "--unified=0", "--end-of-options", effective_base, "--", rel]
     )
     try:
         diff_out = subprocess.check_output(
@@ -1996,11 +2014,11 @@ def _extract_changed_method_owners(
         rel = str(file_abs.relative_to(git_root))
     except ValueError:
         return []
-    effective_base = base_ref if base_ref else "HEAD~1"
+    effective_base = _validate_ref(base_ref, "--base") if base_ref else "HEAD~1"
     cmd = (
         ["git", "diff", "--unified=0", "--", rel]
         if use_working_tree
-        else ["git", "diff", "--unified=0", effective_base, "--", rel]
+        else ["git", "diff", "--unified=0", "--end-of-options", effective_base, "--", rel]
     )
     try:
         diff_out = subprocess.check_output(

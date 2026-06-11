@@ -22,6 +22,21 @@ def _stash_pop():
 
 _stashed = _stash()
 
+# Import the committed module (after stash) for function-level security checks.
+import shlex
+sys.path.insert(0, str(REPO))
+import assess_impact as _ai
+
+
+def _mk_result(**kw):
+    base = dict(
+        changes=[], affected_source_projects=[], affected_test_projects=[],
+        affected_test_classes=set(), test_filter="", test_project_paths=[],
+        workspace_files=[], run_all=False, reason="t",
+    )
+    base.update(kw)
+    return _ai.ImpactResult(**base)
+
 
 def tia(extra_args=(), root=None):
     r = subprocess.run(
@@ -340,7 +355,7 @@ try:
         print(f"         appb excluded     : {paths_ok}")
     # Maven -pl selects by artifactId, not directory name
     cmd = result.get("test_command", "")
-    ok = '-pl ":appa-services"' in cmd
+    ok = "-pl :appa-services" in cmd
     if ok:
         PASS += 1
     else:
@@ -390,9 +405,9 @@ try:
     # a --tests pattern matching nothing fails the task
     cmd = result.get("test_command", "")
     ok = (
-        ':core:model:test --tests="MoneyTest' in cmd
-        and ':feature:checkout:test --tests="CheckoutEngineTest"' in cmd
-        and './gradlew :app:test &&' in cmd          # plain: no foreign classes
+        ":core:model:test --tests=MoneyTest" in cmd
+        and ":feature:checkout:test --tests=CheckoutEngineTest" in cmd
+        and "./gradlew :app:test &&" in cmd          # plain: no foreign classes
     )
     if ok:
         PASS += 1
@@ -509,6 +524,91 @@ try:
           expect_projects=["@plain/core", "@plain/services"], exact=True)
 finally:
     restore(np_src, orig)
+
+print("\n── Security: shell-safe test_command rendering ──────────────────────")
+
+# A path / module / filter carrying shell metacharacters must be rendered
+# shell-safe — CI consumes test_command via `run: ${{ ...test_command }}`,
+# which re-parses it in a shell. (Functional checks; no files needed.)
+PWN = "/tmp/a b;touch HACKED"
+qpath = shlex.quote(PWN)
+
+
+def _sec_check(label, cmd, must_contain, must_not_contain):
+    global PASS, FAIL
+    ok = must_contain in cmd and must_not_contain not in cmd
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] {label}")
+    if not ok:
+        print(f"         cmd: {cmd}")
+
+
+# .NET — project path interpolated into the command
+_sec_check(
+    ".NET path shell-quoted",
+    _ai.DotNetAdapter().fmt_command(
+        _mk_result(test_project_paths=[PWN], affected_test_projects=["X"])
+    ),
+    must_contain=qpath, must_not_contain=f'"{PWN}"',
+)
+
+# Maven — module artifactId interpolated after -pl
+_sec_check(
+    "Maven -pl module shell-quoted",
+    _ai.JavaAdapter().fmt_command(
+        _mk_result(
+            test_project_paths=["/x/mod/pom.xml"],
+            affected_test_projects=[PWN],
+            workspace_files=["/x/pom.xml"],
+        )
+    ),
+    must_contain=shlex.quote(f":{PWN}"), must_not_contain=f'":{PWN}"',
+)
+
+# Node — test_filter (derived from file stems) interpolated for the runner
+_sec_check(
+    "Node filter shell-quoted",
+    _ai.NodeAdapter().fmt_command(
+        _mk_result(
+            test_project_paths=["/x/pkg/package.json"],
+            affected_test_projects=["x"],
+            test_filter=PWN,
+        )
+    ),
+    must_contain=qpath, must_not_contain=f'"{PWN}"',
+)
+
+# Git refs must reject a leading dash (argument injection into git diff)
+_g1 = _ai._GIT_REF_RE.match("-S") is None
+_g2 = _ai._GIT_REF_RE.match("HEAD~1") is not None  # legit ref still accepted
+_g3 = _ai._GIT_REF_RE.match("origin/main") is not None
+if _g1 and _g2 and _g3:
+    PASS += 1
+    print("  [PASS] Git ref regex rejects leading dash, accepts real refs")
+else:
+    FAIL += 1
+    print(f"  [FAIL] Git ref regex (reject '-S'={_g1}, accept HEAD~1={_g2}, origin/main={_g3})")
+
+# Symlinked source files must not be read into the test-file cache
+import tempfile
+try:
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        secret = tdp / "secret.txt"
+        secret.write_text("class LeakedSecret { }", encoding="utf-8")
+        link = tdp / "Linked.cs"
+        link.symlink_to(secret)  # raises on Windows without privilege
+        proj = _ai.Project(name="T", path=tdp / "T.csproj", is_test_project=True)
+        cache = _ai.DotNetAdapter().build_test_file_cache([proj])
+        ok = link not in cache
+        PASS += 1 if ok else 0
+        FAIL += 0 if ok else 1
+        print(f"  [{'PASS' if ok else 'FAIL'}] Symlinked source skipped in cache")
+except OSError:
+    print("  [SKIP] Symlink test (no privilege on this platform)")
 
 print("\n── No changes ────────────────────────────────────────────────────────")
 
