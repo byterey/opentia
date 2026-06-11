@@ -148,6 +148,9 @@ class ImpactResult:
     language: str = "unknown"
     test_command: str = ""
     strategy_notes: List[str] = field(default_factory=list)
+    # Glob patterns (posix-style) where the test runner writes result files
+    # (JUnit XML / TRX), for CI artifact upload and test-report publishing.
+    test_result_paths: List[str] = field(default_factory=list)
 
     @property
     def solution_paths(self) -> List[str]:
@@ -470,6 +473,11 @@ class LanguageAdapter(abc.ABC):
     def fmt_command(self, result: ImpactResult) -> str:
         """Return the test command as a single-line string."""
 
+    def result_globs(self, result: ImpactResult) -> List[str]:
+        """Posix-style glob patterns where the runner writes result files
+        (JUnit XML / TRX) for the selected projects. Default: none."""
+        return []
+
     def is_test_file(self, path: str) -> bool:
         """True if path is a test file (not production source).
         DotNetAdapter overrides to True: .NET test projects contain only tests.
@@ -770,20 +778,29 @@ class DotNetAdapter(LanguageAdapter):
     def extract_test_identifiers(self, file_path: Path, content: str) -> List[str]:
         return _DOTNET_TEST_CLASS_RE.findall(content)
 
+    @staticmethod
+    def _trx_args(extra_args: List[str]) -> List[str]:
+        """Default to the built-in TRX logger so a result artifact exists for
+        CI publishing — unless the caller already passed their own --logger."""
+        if any(a == "--logger" or a.startswith("--logger") for a in extra_args):
+            return []
+        return ["--logger", "trx"]
+
     def run_tests(
         self, result: ImpactResult, extra_args: List[str], cwd: Optional[Path],
     ) -> int:
+        trx = self._trx_args(extra_args)
         if result.run_all and not result.test_filter:
             if result.workspace_files:
                 code = 0
                 for sln in result.workspace_files:
-                    cmd = ["dotnet", "test", sln, *extra_args]
+                    cmd = ["dotnet", "test", sln, *extra_args, *trx]
                     print(f"\n[RUN] {' '.join(cmd)}\n")
                     rc = subprocess.call(cmd, cwd=str(cwd) if cwd else None)
                     if rc != 0:
                         code = rc
                 return code
-            cmd = ["dotnet", "test", *extra_args]
+            cmd = ["dotnet", "test", *extra_args, *trx]
             print(f"\n[RUN] {' '.join(cmd)}\n")
             return subprocess.call(cmd, cwd=str(cwd) if cwd else None)
 
@@ -795,7 +812,7 @@ class DotNetAdapter(LanguageAdapter):
         for proj in result.test_project_paths:
             proj_filter = self._project_filter(proj, result)
             filter_args = ["--filter", proj_filter] if proj_filter else []
-            cmd = ["dotnet", "test", proj, *extra_args, *filter_args]
+            cmd = ["dotnet", "test", proj, *extra_args, *filter_args, *trx]
             print(f"\n[RUN] {' '.join(cmd)}\n")
             rc = subprocess.call(cmd, cwd=str(cwd) if cwd else None)
             if rc != 0:
@@ -803,18 +820,26 @@ class DotNetAdapter(LanguageAdapter):
         return code
 
     def fmt_command(self, result: ImpactResult) -> str:
+        trx = " --logger trx"
         if result.run_all and not result.test_filter:
             if result.workspace_files:
-                return " && ".join(f"dotnet test {_shq(s)}" for s in result.workspace_files)
-            return "dotnet test"
+                return " && ".join(f"dotnet test {_shq(s)}{trx}" for s in result.workspace_files)
+            return f"dotnet test{trx}"
         if not result.test_project_paths:
             return "(no tests to run)"
         parts = []
         for p in result.test_project_paths:
             proj_filter = self._project_filter(p, result)
             filter_part = f" --filter {_shq(proj_filter)}" if proj_filter else ""
-            parts.append(f"dotnet test {_shq(p)}{filter_part}")
+            parts.append(f"dotnet test {_shq(p)}{filter_part}{trx}")
         return " && ".join(parts)
+
+    def result_globs(self, result: ImpactResult) -> List[str]:
+        # The TRX logger writes to <project>/TestResults/ by default.
+        return [
+            (Path(p).parent / "TestResults" / "*.trx").as_posix()
+            for p in result.test_project_paths
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1429,6 +1454,21 @@ class JavaAdapter(LanguageAdapter):
                 parts.append(f"mvn test -pl {_shq(':' + module_name)}{filter_str}")
         return " && ".join(parts)
 
+    def result_globs(self, result: ImpactResult) -> List[str]:
+        globs: List[str] = []
+        for proj_path in result.test_project_paths:
+            d = Path(proj_path).parent
+            if self._is_gradle_project(proj_path):
+                if self._is_android_module(proj_path):
+                    # default unit-test variant + connected (instrumented)
+                    globs.append((d / "build/test-results/testDebugUnitTest/TEST-*.xml").as_posix())
+                    globs.append((d / "build/outputs/androidTest-results/connected/TEST-*.xml").as_posix())
+                else:
+                    globs.append((d / "build/test-results/test/TEST-*.xml").as_posix())
+            else:
+                globs.append((d / "target/surefire-reports/TEST-*.xml").as_posix())
+        return globs
+
 
 # ---------------------------------------------------------------------------
 # Node.js adapter  (Jest / Vitest / Mocha)
@@ -1825,6 +1865,23 @@ class NodeAdapter(LanguageAdapter):
             return "(no tests to run)"
         return f"{base} {_shq(result.test_filter)}" if result.test_filter else base
 
+    def result_globs(self, result: ImpactResult) -> List[str]:
+        # Best-effort: jest/vitest emit JUnit XML only with an extra reporter
+        # (jest-junit / vitest --reporter=junit), whose output path is
+        # user-configured. Report the common conventional locations per
+        # package + workspace root; non-matching globs are harmless in CI.
+        dirs = [Path(p).parent for p in result.test_project_paths]
+        dirs += [Path(w).parent for w in result.workspace_files]
+        globs: List[str] = []
+        seen: Set[str] = set()
+        for d in dirs:
+            for rel in ("junit.xml", "test-results/*.xml", "test-results/**/*.xml"):
+                g = (d / rel).as_posix()
+                if g not in seen:
+                    seen.add(g)
+                    globs.append(g)
+        return globs
+
 
 # ---------------------------------------------------------------------------
 # Adapter detection
@@ -2201,6 +2258,7 @@ def assess(
 
     def _finalize(result: ImpactResult) -> ImpactResult:
         result.test_command = adapter.fmt_command(result)
+        result.test_result_paths = adapter.result_globs(result)
         return result
 
     # ── 2. Classify ───────────────────────────────────────────────────────
@@ -2563,6 +2621,7 @@ def _merge_results(results: List[ImpactResult]) -> ImpactResult:
         language=",".join(r.language for r in results),
         test_command=" && ".join(commands) or "(no tests to run)",
         strategy_notes=[x for r in results for x in r.strategy_notes],
+        test_result_paths=[x for r in results for x in r.test_result_paths],
     )
 
 
@@ -2613,6 +2672,10 @@ def _fmt_human_one(result: ImpactResult) -> str:
         f"    {result.test_command}",
     ]
 
+    if result.test_result_paths:
+        lines += ["", "  result artifacts (for CI publishing):"]
+        lines += [f"    • {g}" for g in result.test_result_paths]
+
     if result.strategy_notes:
         lines += ["", "  Notes:"]
         for note in result.strategy_notes:
@@ -2642,6 +2705,7 @@ def _result_dict(result: ImpactResult) -> Dict:
         "test_project_paths": result.test_project_paths,
         "workspace_files": result.workspace_files,
         "test_command": result.test_command,
+        "test_result_paths": result.test_result_paths,
         "strategy_notes": result.strategy_notes,
     }
 
@@ -2665,13 +2729,18 @@ def fmt_github_actions(results: List[ImpactResult]) -> str:
     }
     # shlex.quote ensures values with spaces, quotes, or special chars are safe.
     lines = [f"echo {shlex.quote(f'{k}={v}')} >> $GITHUB_OUTPUT" for k, v in simple.items()]
-    cmd = result.test_command
-    # Heredoc syntax for multi-line / quote-containing test_command value.
-    lines += [
-        'printf "test_command<<__GHA_EOF__\\n" >> $GITHUB_OUTPUT',
-        f'printf "%s\\n" {shlex.quote(cmd)} >> $GITHUB_OUTPUT',
-        'printf "__GHA_EOF__\\n" >> $GITHUB_OUTPUT',
-    ]
+
+    # Heredoc for multi-line / quote-containing values (command + glob list,
+    # the latter newline-joined to drop straight into actions/upload-artifact).
+    def _heredoc(key: str, value: str) -> List[str]:
+        return [
+            f'printf "{key}<<__GHA_EOF__\\n" >> $GITHUB_OUTPUT',
+            f'printf "%s\\n" {shlex.quote(value)} >> $GITHUB_OUTPUT',
+            'printf "__GHA_EOF__\\n" >> $GITHUB_OUTPUT',
+        ]
+
+    lines += _heredoc("test_command", result.test_command)
+    lines += _heredoc("test_result_paths", "\n".join(result.test_result_paths))
     return "\n".join(lines)
 
 
@@ -2688,6 +2757,7 @@ def fmt_azure_devops(results: List[ImpactResult]) -> str:
         "testProjectPaths": ",".join(result.test_project_paths),
         "hasTests": str(bool(result.test_project_paths or result.run_all)).lower(),
         "testCommand": result.test_command,
+        "testResultPaths": ",".join(result.test_result_paths),
     }
     return "\n".join(
         f"echo '##vso[task.setvariable variable={k}]{_ado_escape(v)}'"

@@ -644,6 +644,65 @@ try:
 except OSError:
     print("  [SKIP] Symlink test (no privilege on this platform)")
 
+print("\n── Result artifacts for CI publishing (test_result_paths) ───────────")
+
+# Gradle result globs are variant-aware: Android unit → testDebugUnitTest dir,
+# plain-JVM → test dir.
+and_src = AND / "core/model/src/main/java/com/example/core/model/Money.kt"
+orig = patch(and_src)
+try:
+    result = tia(root=AND)
+    paths = " ".join(result.get("test_result_paths", []))
+    ok = (
+        "build/test-results/testDebugUnitTest/TEST-*.xml" in paths  # app (android)
+        and "build/test-results/test/TEST-*.xml" in paths           # model/checkout (jvm)
+    )
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] Gradle result globs variant-aware")
+    if not ok:
+        print(f"         paths: {result.get('test_result_paths')}")
+finally:
+    restore(and_src, orig)
+
+# Maven result globs → surefire-reports
+jm_src = REPO / "java-multi-app/services/src/main/java/com/example/services/OrderService.java"
+orig = patch(jm_src)
+try:
+    result = tia(root=REPO / "java-multi-app")
+    paths = " ".join(result.get("test_result_paths", []))
+    ok = "target/surefire-reports/TEST-*.xml" in paths
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] Maven result globs → surefire-reports")
+    if not ok:
+        print(f"         paths: {result.get('test_result_paths')}")
+finally:
+    restore(jm_src, orig)
+
+# .NET emits a TRX logger (built-in) so a result artifact actually exists,
+# and reports its TestResults/*.trx glob
+orig = patch(APP / "src/MultiApp.Domain/Services/OrderDomainService.cs")
+try:
+    result = tia()
+    cmd = result.get("test_command", "")
+    paths = " ".join(result.get("test_result_paths", []))
+    ok = "--logger" in cmd and "trx" in cmd and "TestResults/*.trx" in paths
+    if ok:
+        PASS += 1
+    else:
+        FAIL += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] .NET trx logger + TestResults glob")
+    if not ok:
+        print(f"         cmd: {cmd[:120]}")
+        print(f"         paths: {result.get('test_result_paths')}")
+finally:
+    restore(APP / "src/MultiApp.Domain/Services/OrderDomainService.cs", orig)
+
 print("\n── No changes ────────────────────────────────────────────────────────")
 
 result = tia()
