@@ -1,0 +1,2 @@
+@rem Stub Gradle wrapper for TIA fixture resolution tests (never executed).
+@echo stub gradlew %*
