@@ -21,7 +21,7 @@ Usage:
 
 from __future__ import annotations
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 import abc
 import argparse
@@ -1281,6 +1281,32 @@ class JavaAdapter(LanguageAdapter):
         groot = self._gradle_root(Path(proj_path).parent)
         return self._gradle_wrapper(groot), groot
 
+    _ANDROID_PLUGIN_RE = re.compile(r'com\.android\.(?:application|library|test|dynamic-feature)')
+
+    def _is_android_module(self, proj_path: str) -> bool:
+        """True if the module applies an Android Gradle plugin. Android modules
+        expose per-variant unit-test tasks (testDebugUnitTest); their plain
+        `test` task is a lifecycle anchor that rejects --tests."""
+        try:
+            content = Path(proj_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return self._ANDROID_PLUGIN_RE.search(content) is not None
+
+    def _gradle_unit_task(self, proj_path: str, mp: str) -> str:
+        suffix = "testDebugUnitTest" if self._is_android_module(proj_path) else "test"
+        return f":{mp}:{suffix}" if mp else suffix
+
+    def _gradle_connected_task(self, mp: str) -> str:
+        # Variant task — the connectedAndroidTest anchor does not take filters.
+        return f":{mp}:connectedDebugAndroidTest" if mp else "connectedDebugAndroidTest"
+
+    @staticmethod
+    def _gradle_test_pattern(test_id: str) -> str:
+        # Gradle matches --tests against the fully-qualified name; opentia only
+        # has simple class names, so wildcard-prefix to match any package.
+        return f"*{test_id}"
+
     def run_tests(
         self, result: ImpactResult, extra_args: List[str], cwd: Optional[Path],
     ) -> int:
@@ -1319,8 +1345,8 @@ class JavaAdapter(LanguageAdapter):
                 launcher, run_dir = self._gradle_launcher(proj_path)
                 run_cwd = run_dir or cwd
                 mp = self._gradle_module_path(proj_path)
-                test_task = f":{mp}:test" if mp else "test"
-                connected_task = f":{mp}:connectedAndroidTest" if mp else "connectedAndroidTest"
+                test_task = self._gradle_unit_task(proj_path, mp)
+                connected_task = self._gradle_connected_task(mp)
                 if result.test_filter:
                     unit, instr = self._module_classes(
                         proj_path, result.affected_test_classes
@@ -1328,13 +1354,12 @@ class JavaAdapter(LanguageAdapter):
                     if unit:
                         cmds.append([
                             launcher, test_task,
-                            *(f"--tests={c}" for c in sorted(unit)), *extra_args,
+                            *(f"--tests={self._gradle_test_pattern(c)}" for c in sorted(unit)),
+                            *extra_args,
                         ])
                     if instr:
-                        cmds.append([
-                            launcher, connected_task,
-                            *(f"--tests={c}" for c in sorted(instr)), *extra_args,
-                        ])
+                        # connected tests take no --tests; run the module's suite
+                        cmds.append([launcher, connected_task, *extra_args])
                 if not cmds:
                     cmds.append([launcher, test_task, *extra_args])
             else:
@@ -1370,18 +1395,21 @@ class JavaAdapter(LanguageAdapter):
             gradle = self._is_gradle_project(proj_path)
             if gradle:
                 mp = self._gradle_module_path(proj_path)
-                test_task = f":{mp}:test" if mp else "test"
-                connected_task = f":{mp}:connectedAndroidTest" if mp else "connectedAndroidTest"
+                test_task = self._gradle_unit_task(proj_path, mp)
+                connected_task = self._gradle_connected_task(mp)
                 if result.test_filter:
                     unit, instr = self._module_classes(
                         proj_path, result.affected_test_classes
                     )
                     if unit:
-                        filters = " ".join(f"--tests={_shq(c)}" for c in sorted(unit))
+                        filters = " ".join(
+                            f"--tests={_shq(self._gradle_test_pattern(c))}"
+                            for c in sorted(unit)
+                        )
                         parts.append(f"./gradlew {_shq(test_task)} {filters}")
                     if instr:
-                        filters = " ".join(f"--tests={_shq(c)}" for c in sorted(instr))
-                        parts.append(f"./gradlew {_shq(connected_task)} {filters}")
+                        # connected tests take no --tests; run the module's suite
+                        parts.append(f"./gradlew {_shq(connected_task)}")
                     if not unit and not instr:
                         parts.append(f"./gradlew {_shq(test_task)}")
                 else:

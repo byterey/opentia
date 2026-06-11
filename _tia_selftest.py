@@ -401,13 +401,13 @@ try:
     result = tia(root=AND)
     check("Kotlin core change → model + checkout + app (nested refs)", result,
           expect_projects=["model", "checkout", "app"], exact=True)
-    # Per-module filters: each gradle task carries only its own classes —
-    # a --tests pattern matching nothing fails the task
+    # Per-module filters (wildcard-prefixed for FQN matching); plain-JVM
+    # modules use :module:test, Android modules use :module:testDebugUnitTest.
     cmd = result.get("test_command", "")
     ok = (
-        ":core:model:test --tests=MoneyTest" in cmd
-        and ":feature:checkout:test --tests=CheckoutEngineTest" in cmd
-        and "./gradlew :app:test &&" in cmd          # plain: no foreign classes
+        ":core:model:test --tests='*MoneyTest" in cmd
+        and ":feature:checkout:test --tests='*CheckoutEngineTest'" in cmd
+        and "./gradlew :app:testDebugUnitTest &&" in cmd   # android, no foreign classes
     )
     if ok:
         PASS += 1
@@ -437,22 +437,28 @@ try:
 finally:
     restore(and_src, orig)
 
-# Instrumented tests under src/androidTest must be discovered and routed
-# to the connectedAndroidTest task
+# Instrumented tests under src/androidTest must be discovered and routed to
+# the variant connected task (connectedDebugAndroidTest), which — unlike
+# unit tasks — takes no --tests filter
 and_src = AND / "app/src/main/java/com/example/app/CheckoutScreen.kt"
 orig = patch(and_src)
 try:
     result = tia(root=AND)
     ids = {i.split(".")[0] for i in result.get("affected_test_classes", [])}
     cmd = result.get("test_command", "")
-    ok = "CheckoutScreenTest" in ids and "connectedAndroidTest" in cmd
+    ok = (
+        "CheckoutScreenTest" in ids
+        and "connectedDebugAndroidTest" in cmd
+        and "connectedDebugAndroidTest --tests" not in cmd
+    )
     if ok:
         PASS += 1
     else:
         FAIL += 1
-    print(f"  [{'PASS' if ok else 'FAIL'}] androidTest source → CheckoutScreenTest + connectedAndroidTest")
+    print(f"  [{'PASS' if ok else 'FAIL'}] androidTest source → CheckoutScreenTest + connectedDebugAndroidTest")
     if not ok:
         print(f"         identifiers: {sorted(ids)}")
+        print(f"         cmd: {cmd}")
         print(f"         test_command: {cmd}")
 finally:
     restore(and_src, orig)
