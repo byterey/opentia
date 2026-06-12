@@ -2,93 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Working style
-
-### Before any code change
-
-State assumptions explicitly. If multiple interpretations exist, name them and confirm before picking one. If a simpler approach exists, say so.
-
-For multi-step tasks, state a brief plan first:
-
-```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
-```
-
-Transform vague requests into verifiable goals before starting — e.g. "fix the bug" → "reproduce it in a test, then make the test pass".
-
-### Code changes
-
-- Touch only what the request requires. Do not improve adjacent code.
-- Match existing style. No abstractions or configurability beyond what was asked.
-- Every changed line must trace directly to the request.
-- If unrelated dead code is noticed, mention it — don't delete it.
-- Remove only imports/variables/functions that **your** changes made unused.
-
-### Response style
-
-- No preamble, affirmations, or filler. Answer directly; lead with code when code is the answer.
-- Omit explanation unless asked. If asked, max 3 sentences.
-- Error responses: state what failed + fix only.
-
-### File enumeration
-
-Use `git ls-files --cached --others --exclude-standard` to enumerate source files.
-To verify a specific path: `git check-ignore -v <path>`
-
-**Skip directories** (any path segment matching these):
-
-| Ecosystem | Skip directories |
-|---|---|
-| All | `.git/` `.github/` (actions are readable; secrets are not) |
-| Java / Android | `build/` `.gradle/` `.cxx/` `.externalNativeBuild/` `captures/` |
-| C# / .NET | `bin/` `obj/` `.vs/` `packages/` `.nuget/` |
-| Node.js | `node_modules/` `dist/` `.next/` `.nuxt/` `.cache/` `coverage/` `.turbo/` |
-
-**Skip file extensions** (compiled output, binaries, secrets):
-
-| Ecosystem | Skip extensions |
-|---|---|
-| Java / Android | `.class` `.dex` `.apk` `.aab` `.aar` `.hprof` `.jks` `.keystore` |
-| C# / .NET | `.dll` `.exe` `.pdb` `.nupkg` `.snupkg` |
-| Node.js | `.map` (source maps) |
-| All | `.log` `.lock` (e.g. `package-lock.json`, `yarn.lock`, `packages.lock.json`) |
-
-**Skip specific filenames:**
-
-`local.properties`, `lint-results*`, `*.user`, `*.suo`, `*.DS_Store`
-
-On a blocked path: state the path, ask for the source file instead.
-
-### Tool permission labels
-
-Prefix every permission prompt with one of:
-
-- `[READ-ONLY]` — reads only, no state change
-- `[MUTATION]` — modifies files/state, recoverable via git
-- `[DESTRUCTIVE]` — irreversible (delete, force-push, drop table)
-- `[SYSTEM]` — touches packages, permissions, OS-level config
-
-### Test failure triage
-
-Default assumption: **the application is wrong, not the test.** The test is a specification of correct behaviour.
-
-Decision tree — follow in order, stop at first match:
-
-1. Test asserts something the app genuinely should do → fix the application, do not touch the test.
-2. A recent change intentionally altered the behaviour the test was specifying → update the test, document why in a comment.
-3. Test asserts the wrong thing (wrong expected value, tests internal implementation, assumption never true) → fix the test; state _"this test was wrong because …"_ before changing it.
-4. Test environment is the problem (flaky clock, shared state, missing double, OS-specific path) → fix the infrastructure; do not weaken the assertion.
-
-Never: delete a failing test, change an assertion to match broken output, mark a test ignored without a filed issue + expiry condition, or weaken an assertion to paper over a regression.
-
 ## What this repo is
 
 A **multi-language Test Impact Analysis (TIA)** tool, published to PyPI as `opentia`. Given a git diff, `assess_impact.py` selects only the tests whose execution path could have been affected by the change — avoiding a full suite run on every push.
 
 Supported ecosystems via `LanguageAdapter` subclasses: **C# / .NET** (`.sln`/`.csproj`), **Java / Android** (Maven + Gradle; Kotlin-aware, nested Gradle modules, `src/androidTest` → `connectedAndroidTest`), **Node.js** (Jest / Vitest / npm test scripts; npm, pnpm, and lerna workspaces). Polyglot repos are handled in one run — changes are partitioned to the adapter owning their nearest build-file ancestor.
 
-The repo contains tracked validation apps (see *Validation apps* below) and a scenario harness, `_tia_selftest.py`.
+The repo contains tracked validation apps (see _Validation apps_ below) and a scenario harness, `_tia_selftest.py`.
 
 ## Running the script
 
@@ -179,19 +99,20 @@ ImpactResult per adapter → formatter → stdout
 
 ### File classification rules (in priority order)
 
-| Category | Trigger (per adapter) | Behaviour |
-|---|---|---|
-| `INFRA` | build files: `.sln`/`.csproj`, `pom.xml`/`build.gradle`, `package.json`, tool configs | **Tiered:** workspace-level → run all; module-level build file → scope via dependency graph and drop class-level filters |
-| `IGNORED` | `.md`, images, archives; dotfiles: `.gitignore`, `.editorconfig` | Skip — no tests |
-| `SOURCE` | `.cs` / `.java` `.kt` / `.ts` `.js` etc. | Full 3-strategy analysis |
-| `CONFIG` | `.json`, `.xml`, `.yaml`, `.resx`, `.razor`, `.properties`, etc. | Find owning project, run its tests + dependents |
-| `UNKNOWN` | Anything else | Run all tests (safe fallback) |
+| Category  | Trigger (per adapter)                                                                 | Behaviour                                                                                                                |
+| --------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `INFRA`   | build files: `.sln`/`.csproj`, `pom.xml`/`build.gradle`, `package.json`, tool configs | **Tiered:** workspace-level → run all; module-level build file → scope via dependency graph and drop class-level filters |
+| `IGNORED` | `.md`, images, archives; dotfiles: `.gitignore`, `.editorconfig`                      | Skip — no tests                                                                                                          |
+| `SOURCE`  | `.cs` / `.java` `.kt` / `.ts` `.js` etc.                                              | Full 3-strategy analysis                                                                                                 |
+| `CONFIG`  | `.json`, `.xml`, `.yaml`, `.resx`, `.razor`, `.properties`, etc.                      | Find owning project, run its tests + dependents                                                                          |
+| `UNKNOWN` | Anything else                                                                         | Run all tests (safe fallback)                                                                                            |
 
 Workspace-level = `.sln`, root/parent `pom.xml`, `settings.gradle`, root `package.json`, `pnpm-workspace.yaml`, `libs.versions.toml`, `global.json`, `Directory.Build.*`. Module-level = a discovered project's own build file. Files under hidden tooling dirs (`.github/`, `.claude/`, `.vscode/`, …) and `local.properties` are always IGNORED.
 
 ### Safe fallback chain
 
 When targeted selection fails, the script escalates rather than silently skipping tests:
+
 1. Unmatched source file → run all test projects
 2. Source project changed but nothing in the dependency graph covers it → run all test projects
 3. Config file with no owning project → run all test projects
@@ -212,20 +133,20 @@ When targeted selection fails, the script escalates rather than silently skippin
 
 ## Validation apps
 
-| App | Shape | Exercises |
-|---|---|---|
-| `sample-app/` | C# 3-layer + 2 test projects | transitive BFS (Core → both test projects) |
-| `multi-app/` | C# 4-layer diamond | layer isolation; `_tia_selftest.py` default target |
-| `java-sample-app/` | single Maven module | single-module behaviour |
-| `java-multi-app/` | Maven 4-module diamond | Java mixed modules, transitive deps |
-| `java-fullstack-app/` | Maven backend + Angular frontend | polyglot routing, karma `npm test` fallback |
-| `node-sample-app/` | single npm package | single-package Node |
-| `node-mono-app/` | npm workspaces (`workspace:*` deps) | workspace dependency graph |
-| `node-plain-mono/` | pnpm-style (plain-version internal deps, hoisted jest) | pnpm/lerna detection, name-matched dep edges |
-| `collision-app/` | two C# apps, same-stem `Core.csproj` | path-based ProjectReference resolution |
-| `java-collision-app/` | two Maven apps, colliding `core` artifactIds | group:artifact qualified matching |
-| `android-app/` | Kotlin, nested Gradle modules (`:core:model`), unit + instrumented tests | Kotlin symbols/methods, androidTest routing, nested refs, per-module filters, version-catalog INFRA |
-| `gradle-nested/` | settings.gradle one level below `--root` | ref resolution anchored at the settings root, not `--root` |
+| App                   | Shape                                                                    | Exercises                                                                                           |
+| --------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `sample-app/`         | C# 3-layer + 2 test projects                                             | transitive BFS (Core → both test projects)                                                          |
+| `multi-app/`          | C# 4-layer diamond                                                       | layer isolation; `_tia_selftest.py` default target                                                  |
+| `java-sample-app/`    | single Maven module                                                      | single-module behaviour                                                                             |
+| `java-multi-app/`     | Maven 4-module diamond                                                   | Java mixed modules, transitive deps                                                                 |
+| `java-fullstack-app/` | Maven backend + Angular frontend                                         | polyglot routing, karma `npm test` fallback                                                         |
+| `node-sample-app/`    | single npm package                                                       | single-package Node                                                                                 |
+| `node-mono-app/`      | npm workspaces (`workspace:*` deps)                                      | workspace dependency graph                                                                          |
+| `node-plain-mono/`    | pnpm-style (plain-version internal deps, hoisted jest)                   | pnpm/lerna detection, name-matched dep edges                                                        |
+| `collision-app/`      | two C# apps, same-stem `Core.csproj`                                     | path-based ProjectReference resolution                                                              |
+| `java-collision-app/` | two Maven apps, colliding `core` artifactIds                             | group:artifact qualified matching                                                                   |
+| `android-app/`        | Kotlin, nested Gradle modules (`:core:model`), unit + instrumented tests | Kotlin symbols/methods, androidTest routing, nested refs, per-module filters, version-catalog INFRA |
+| `gradle-nested/`      | settings.gradle one level below `--root`                                 | ref resolution anchored at the settings root, not `--root`                                          |
 
 ## Extending to other languages
 
