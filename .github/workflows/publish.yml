@@ -2,8 +2,8 @@ name: Publish to PyPI
 
 on:
   push:
-    branches:
-      - release
+    tags:
+      - "v*"
 
 jobs:
   publish:
@@ -19,6 +19,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Check tag matches package version
+        run: |
+          pkg_version="$(python -c 'import assess_impact; print(assess_impact.__version__)')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$pkg_version" != "$tag_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME (=$tag_version) does not match __version__ ($pkg_version)"
+            exit 1
+          fi
 
       - name: Build
         run: |
