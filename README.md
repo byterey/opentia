@@ -10,10 +10,10 @@ Analyses a git diff and selects only the tests whose execution path could have b
 
 ## Requirements
 
-| Tool | Version | Purpose |
-|---|---|---|
-| Python | 3.8+ | Run opentia |
-| Git | any | Diff source |
+| Tool   | Version | Purpose     |
+| ------ | ------- | ----------- |
+| Python | 3.8+    | Run opentia |
+| Git    | any     | Diff source |
 
 ---
 
@@ -81,16 +81,16 @@ opentia --base HEAD~1 --root . --output azure-devops
 
 ```jsonc
 {
-  "run_all": false,               // true = targeted selection was abandoned
-  "language": "dotnet",          // dotnet | java | node
+  "run_all": false, // true = targeted selection was abandoned
+  "language": "dotnet", // dotnet | java | node
   "test_filter": "FullyQualifiedName~PricingServiceTests",
   "test_project_paths": ["...SampleApp.Services.Tests.csproj"],
   "affected_test_projects": ["SampleApp.Services.Tests"],
   "affected_test_classes": ["PricingServiceTests"],
   "test_command": "dotnet test \"...\" --filter \"...\" --logger trx",
-  "test_result_paths": [".../TestResults/*.trx"],  // result globs for CI
+  "test_result_paths": [".../TestResults/*.trx"], // result globs for CI
   "reason": "Analysis complete",
-  "strategy_notes": []            // warnings / fallback explanations
+  "strategy_notes": [], // warnings / fallback explanations
 }
 ```
 
@@ -100,12 +100,12 @@ When changes span multiple ecosystems in one run, the same fields are emitted me
 
 `test_result_paths` lists posix-style globs where the runner writes result files, so CI can upload/publish exactly the tests that ran:
 
-| Runner | Emits results by default? | Glob |
-|---|---|---|
-| Gradle (incl. Android) | yes | `<module>/build/test-results/<task>/TEST-*.xml` — variant-aware (`testDebugUnitTest` for Android unit, `test` for plain JVM); `build/outputs/androidTest-results/` for instrumented |
-| Maven | yes | `<module>/target/surefire-reports/TEST-*.xml` |
-| .NET | **with `--logger`** | opentia defaults the command to `--logger trx` (built-in), so `<project>/TestResults/*.trx` is produced; pass your own `-- --logger ...` to override |
-| Node (Jest/Vitest) | no | best-effort common locations only — JUnit XML requires a reporter you configure (`jest-junit`, or vitest `--reporter=junit --outputFile=`) |
+| Runner                 | Emits results by default? | Glob                                                                                                                                                                                |
+| ---------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Gradle (incl. Android) | yes                       | `<module>/build/test-results/<task>/TEST-*.xml` — variant-aware (`testDebugUnitTest` for Android unit, `test` for plain JVM); `build/outputs/androidTest-results/` for instrumented |
+| Maven                  | yes                       | `<module>/target/surefire-reports/TEST-*.xml`                                                                                                                                       |
+| .NET                   | **with `--logger`**       | opentia defaults the command to `--logger trx` (built-in), so `<project>/TestResults/*.trx` is produced; pass your own `-- --logger ...` to override                                |
+| Node (Jest/Vitest)     | no                        | best-effort common locations only — JUnit XML requires a reporter you configure (`jest-junit`, or vitest `--reporter=junit --outputFile=`)                                          |
 
 ---
 
@@ -186,7 +186,7 @@ jobs:
 
 Available outputs: `test_filter`, `run_all`, `has_tests`, `test_project_paths`, `test_command`, `test_result_paths`.
 
-> **Security:** pass `test_command` through an `env:` variable and run `bash -c "$TEST_COMMAND"`, rather than interpolating `${{ … }}` directly into `run:`. opentia shell-quotes the command components (so the string is safe to evaluate in a POSIX shell), but textual `${{ }}` interpolation pastes the value into the script *before* the shell parses it — the env-indirection keeps a repo-controlled file or directory name from ever being re-parsed as workflow/shell syntax. The emitted command targets a POSIX shell (`bash`); on Windows runners, set `shell: bash`.
+> **Security:** pass `test_command` through an `env:` variable and run `bash -c "$TEST_COMMAND"`, rather than interpolating `${{ … }}` directly into `run:`. opentia shell-quotes the command components (so the string is safe to evaluate in a POSIX shell), but textual `${{ }}` interpolation pastes the value into the script _before_ the shell parses it — the env-indirection keeps a repo-controlled file or directory name from ever being re-parsed as workflow/shell syntax. The emitted command targets a POSIX shell (`bash`); on Windows runners, set `shell: bash`.
 
 ### GitHub Actions — push to branch
 
@@ -215,8 +215,9 @@ Available outputs: `test_filter`, `run_all`, `has_tests`, `test_project_paths`, 
 - task: PublishTestResults@2
   condition: and(always(), eq(variables['hasTests'], 'true'))
   inputs:
-    testResultsFormat: JUnit          # use 'VSTest' for .NET (.trx)
-    testResultsFiles: $(testResultPaths)   # comma-separated globs
+    testResultsFormat: JUnit # use 'VSTest' for .NET (.trx)
+    testResultsFiles: $(testResultPaths) # comma-separated globs
 ```
 
 Available variables: `testFilter`, `runAllTests`, `hasTests`, `testProjectPaths`, `testCommand`, `testResultPaths`.
+.
