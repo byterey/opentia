@@ -28,7 +28,7 @@ Usage:
 
 from __future__ import annotations
 
-__version__ = "1.2.4"
+__version__ = "1.2.5"
 
 import abc
 import argparse
